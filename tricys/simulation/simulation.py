@@ -161,32 +161,34 @@ def run_co_simulation_job(config: dict, job_params: dict, job_id: int = 0) -> st
                         original_asset_path = Path(
                             os.path.abspath(original_asset_path_str)
                         )
-                        original_asset_dir = original_asset_path.parent
-
-                        if not original_asset_dir.exists():
+                        if not original_asset_path.exists():
                             logger.warning(
-                                f"Asset directory '{original_asset_dir}' for parameter '{param_key}' not found. Skipping copy."
+                                f"Asset file '{original_asset_path}' for parameter '{param_key}' not found. Skipping copy."
                             )
                             continue
 
-                        asset_dir_name = original_asset_dir.name
+                        # Create a destination directory based on the asset's parent folder name
+                        # to avoid collisions if multiple files have the same name.
+                        asset_dir_name = original_asset_path.parent.name
                         dest_dir = Path(job_workspace) / asset_dir_name
+                        os.makedirs(dest_dir, exist_ok=True)
 
-                        # Copy the directory only if it hasn't been copied already
-                        if not dest_dir.exists():
-                            shutil.copytree(original_asset_dir, dest_dir)
+                        dest_path = dest_dir / original_asset_path.name
+
+                        # Copy the file only if it hasn't been copied already
+                        if not dest_path.exists():
+                            shutil.copy(original_asset_path, dest_path)
                             logger.info(
-                                "Copied asset directory",
+                                "Copied asset file",
                                 extra={
                                     "job_id": job_id,
-                                    "source_dir": original_asset_dir,
-                                    "destination_dir": dest_dir,
+                                    "source_path": original_asset_path,
+                                    "destination_path": dest_path,
                                 },
                             )
 
                         # Update the path in the config to point to the new location
-                        new_asset_path = dest_dir / original_asset_path.name
-                        handler_config["params"][param_key] = new_asset_path.as_posix()
+                        handler_config["params"][param_key] = dest_path.as_posix()
                         logger.info(
                             "Updated asset parameter path",
                             extra={
@@ -841,6 +843,9 @@ def run_post_processing(
             function_name = task_config["function"]
             params = task_config.get("params", {})
             module = None
+
+            if "llm_env" not in params and isinstance(config.get("llm_env"), dict):
+                params["llm_env"] = config["llm_env"]
 
             # New method: Load from a direct script path
             if "script_path" in task_config:
