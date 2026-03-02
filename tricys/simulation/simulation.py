@@ -653,6 +653,11 @@ def _process_h5_result(
         df = pd.read_csv(res_path)
         df["job_id"] = job_id
 
+        # Force all numeric columns (except job_id) to float to avoid HDF5 schema conflicts
+        for col in df.columns:
+            if col != "job_id" and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].astype(float)
+
         # Use 'append' with data_columns=True for queryability if needed
         store.append("results", df, index=False, data_columns=True)
 
@@ -690,6 +695,11 @@ def _process_h5_result(
 
         param_df = pd.DataFrame([params])
         param_df["job_id"] = job_id
+
+        # Force all numeric columns (except job_id) to float to avoid HDF5 schema conflicts
+        for col in param_df.columns:
+            if col != "job_id" and pd.api.types.is_numeric_dtype(param_df[col]):
+                param_df[col] = param_df[col].astype(float)
 
         # Force object dtype only for string/object columns to avoid HDF5 issues with StringDtype
         for col in param_df.select_dtypes(include=["object", "string"]).columns:
