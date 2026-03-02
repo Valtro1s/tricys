@@ -474,6 +474,7 @@ def run_sequential_sweep(
     config: dict,
     jobs: List[Dict[str, Any]],
     post_job_callback: Callable[[int, Dict[str, Any], str], None] = None,
+    filter_data: bool = False,
 ) -> List[str]:
     """Executes a parameter sweep sequentially.
 
@@ -587,7 +588,26 @@ def run_sequential_sweep(
 
                 # Calculate Summary Metrics
                 metrics_definition = config.get("metrics_definition", {})
-                if metrics_definition and os.path.exists(result_file_path):
+
+                # Pre-filter check before metric calc
+                skip_metrics = False
+                if filter_data and os.path.exists(result_file_path):
+                    try:
+                        temp_df = pd.read_csv(result_file_path)
+                        num_cols = temp_df.select_dtypes(include=["number"]).columns
+                        if (temp_df[num_cols] < 0).any().any():
+                            skip_metrics = True
+                            logger.info(
+                                f"Job {i+1} has negative values. Skipping metric calculations due to filter."
+                            )
+                    except Exception:
+                        pass
+
+                if (
+                    not skip_metrics
+                    and metrics_definition
+                    and os.path.exists(result_file_path)
+                ):
                     try:
                         df_metric = pd.read_csv(result_file_path)
                         single_job_metrics = calculate_single_job_metrics(
@@ -757,6 +777,11 @@ def export_results_to_csv(results_dir: str, hdf_path: str):
             # Read summary for export
             if "/summary" in store.keys():
                 df_summary = store.select("summary")
+
+                # Join with jobs table to include parameters in the summary CSV
+                if not df_jobs.empty:
+                    df_summary = pd.merge(df_jobs, df_summary, on="job_id", how="left")
+
                 summary_csv_path = get_unique_filename(
                     results_dir, "summary_metrics.csv"
                 )
@@ -1296,7 +1321,9 @@ def run_simulation(
                         filter_data=filter_data,
                     )
 
-                run_sequential_sweep(config, jobs, post_job_callback=h5_callback)
+                run_sequential_sweep(
+                    config, jobs, post_job_callback=h5_callback, filter_data=filter_data
+                )
 
     # Export CSV if requested
     if export_csv:
