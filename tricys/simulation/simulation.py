@@ -644,6 +644,7 @@ def _process_h5_result(
     params: dict,
     res_path: str,
     metrics_definition: dict = None,
+    filter_data: bool = False,
 ):
     """Helper to process simulation result into HDF5 store."""
     if not res_path or not os.path.exists(res_path):
@@ -651,6 +652,19 @@ def _process_h5_result(
 
     try:
         df = pd.read_csv(res_path)
+
+        if filter_data:
+            numeric_cols = df.select_dtypes(include=["number"]).columns
+            if (df[numeric_cols] < 0).any().any():
+                logger.warning(
+                    f"Negative values detected in result for job {job_id}. Skipping append to HDF5."
+                )
+                # Cleanup immediately to save disk space
+                job_dir = os.path.dirname(res_path)
+                if os.path.exists(job_dir) and "job_" in os.path.basename(job_dir):
+                    shutil.rmtree(job_dir)
+                return
+
         df["job_id"] = job_id
 
         # Force all numeric columns (except job_id) to float to avoid HDF5 schema conflicts
@@ -1133,7 +1147,9 @@ def _mp_run_co_simulation_job_wrapper(args):
         return job_id, job_params, None, str(e)
 
 
-def run_simulation(config: Dict[str, Any], export_csv: bool = False) -> None:
+def run_simulation(
+    config: Dict[str, Any], export_csv: bool = False, filter_data: bool = False
+) -> None:
     """Orchestrates the main simulation workflow.
 
     Simplified Mode Logic (Unified HDF5 Storage):
@@ -1230,7 +1246,12 @@ def run_simulation(config: Dict[str, Any], export_csv: bool = False) -> None:
                             logger.error(f"Job {job_id} failed: {error}")
                         else:
                             _process_h5_result(
-                                store, job_id, job_p, result_path, metrics_definition
+                                store,
+                                job_id,
+                                job_p,
+                                result_path,
+                                metrics_definition,
+                                filter_data=filter_data,
                             )
 
                 try:
@@ -1252,7 +1273,12 @@ def run_simulation(config: Dict[str, Any], export_csv: bool = False) -> None:
                             config, job_params, job_id=job_id
                         )
                         _process_h5_result(
-                            store, job_id, job_params, result_path, metrics_definition
+                            store,
+                            job_id,
+                            job_params,
+                            result_path,
+                            metrics_definition,
+                            filter_data=filter_data,
                         )
                     except Exception as e:
                         logger.error(f"Job {job_id} failed: {e}")
@@ -1262,7 +1288,12 @@ def run_simulation(config: Dict[str, Any], export_csv: bool = False) -> None:
 
                 def h5_callback(idx, params, res_path):
                     _process_h5_result(
-                        store, idx + 1, params, res_path, metrics_definition
+                        store,
+                        idx + 1,
+                        params,
+                        res_path,
+                        metrics_definition,
+                        filter_data=filter_data,
                     )
 
                 run_sequential_sweep(config, jobs, post_job_callback=h5_callback)
@@ -1292,6 +1323,7 @@ def main(
     config_or_path: Union[str, Dict[str, Any]],
     base_dir: str = None,
     export_csv: bool = False,
+    filter_data: bool = False,
 ) -> None:
     """Main entry point for the simulation runner.
 
@@ -1316,7 +1348,7 @@ def main(
         },
     )
     try:
-        run_simulation(config, export_csv=export_csv)
+        run_simulation(config, export_csv=export_csv, filter_data=filter_data)
         logger.info("Main execution completed successfully")
     except Exception as e:
         logger.error(
@@ -1336,5 +1368,10 @@ if __name__ == "__main__":
         required=True,
         help="Path to the JSON configuration file.",
     )
+    parser.add_argument(
+        "--filter",
+        action="store_true",
+        help="Filter out results containing negative values.",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, filter_data=args.filter)

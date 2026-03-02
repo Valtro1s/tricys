@@ -82,6 +82,11 @@ def main() -> None:
         action="store_true",
         help="Export results to CSV format after simulation.",
     )
+    parser.add_argument(
+        "--filter",
+        action="store_true",
+        help="Filter out results containing negative values before appending to HDF5.",
+    )
 
     # Subparsers for explicit commands
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -145,6 +150,11 @@ def main() -> None:
             basic_parser.add_argument(
                 "--csv", action="store_true", help="Export results to CSV."
             )
+            basic_parser.add_argument(
+                "--filter",
+                action="store_true",
+                help="Filter out results containing negative values.",
+            )
 
             basic_args, _ = basic_parser.parse_known_args(remaining_argv)
 
@@ -183,7 +193,10 @@ def main() -> None:
                     sys.exit(1)
 
             export_csv = main_args.csv or basic_args.csv
-            simulation_main(config_path, export_csv=export_csv)
+            filter_data = getattr(main_args, "filter", False) or getattr(
+                basic_args, "filter", False
+            )
+            simulation_main(config_path, export_csv=export_csv, filter_data=filter_data)
         elif main_args.command == "analysis":
             # This block replaces the logic in simulation_analysis.py's _parse_command_line_args
             analysis_parser = argparse.ArgumentParser(
@@ -333,7 +346,13 @@ def main() -> None:
         print(
             "INFO: No 'sensitivity_analysis' detected in config. Running standard simulation workflow."
         )
-        simulation_main(config_data, base_dir=base_dir, export_csv=main_args.csv)
+        filter_data = getattr(main_args, "filter", False)
+        simulation_main(
+            config_data,
+            base_dir=base_dir,
+            export_csv=main_args.csv,
+            filter_data=filter_data,
+        )
     return
 
 
