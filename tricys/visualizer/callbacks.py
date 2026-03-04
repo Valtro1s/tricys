@@ -1,6 +1,5 @@
-import base64
 import json
-import os
+import math
 
 import dash
 import dash_bootstrap_components as dbc
@@ -9,7 +8,7 @@ import plotly.express as px
 from dash import Input, Output, State, ctx, dcc, html
 
 from tricys.analysis import metric
-from tricys.visualizer.data import load_h5_data
+from tricys.visualizer.data import load_h5_data, load_summary_data
 from tricys.visualizer.filtering import filter_dataframe
 from tricys.visualizer.layout import render_log_content
 
@@ -20,58 +19,19 @@ JOBS_DF = None
 
 def register_callbacks(app):
     @app.callback(
-        Output("full-jobs-data-store", "data"),
-        Output("jobs-table", "columns"),
-        Output("variable-dropdown", "options"),
-        Output("parameter-options-store", "data"),
-        Output("config-store", "data"),
-        Output("log-store", "data"),
-        Output("baseline-dropdown", "options"),
-        Input("upload-data", "contents"),
-        State("upload-data", "filename"),
-    )
-    def update_output(contents, filename):
-        global H5_FILE, JOBS_DF
-        if contents is None:
-            raise dash.exceptions.PreventUpdate
-        content_type, content_string = contents.split(",")
-        decoded = base64.b64decode(content_string)
-        temp_path = os.path.join(os.getcwd(), f"temp_{filename}")
-        with open(temp_path, "wb") as f:
-            f.write(decoded)
-
-        v_opts, p_opts, t_cols, j_data, c_data, l_data = load_h5_data(temp_path)
-
-        # Update globals
-        H5_FILE = temp_path
-        if j_data:
-            JOBS_DF = pd.DataFrame(j_data)
-            # Ensure job_id is column if it was index or renamed to 'id'
-            # The load_h5_data returns records with 'id' instead of 'job_id' for the table.
-            # but we need consistency. Let's look at load_h5_data implementation.
-            # It renames job_id -> id.
-            # So JOBS_DF should have 'id'.
-
-        # Generate baseline options
-        baseline_options = []
-        if JOBS_DF is not None:
-            baseline_options = [
-                {"label": f"Job {row['id']}", "value": row["id"]}
-                for _, row in JOBS_DF.iterrows()
-            ]
-
-        return j_data, t_cols, v_opts, p_opts, c_data, l_data, baseline_options
-
-    @app.callback(
         Output("jobs-table", "data"),
+        Output("jobs-table", "page_count"),
+        Output("jobs-table", "page_current"),
         Input("full-jobs-data-store", "data"),
         Input("jobs-table", "sort_by"),
         Input("jobs-table", "filter_query"),
+        Input("jobs-table", "page_current"),
+        Input("jobs-table", "page_size"),
     )
-    def update_jobs_table(data, sort_by, filter_query):
+    def update_jobs_table(data, sort_by, filter_query, page_current, page_size):
         global JOBS_DF
         if not data:
-            return []
+            return [], 0, 0
 
         # Sync JOBS_DF if it's None (e.g. init from file path)
         if JOBS_DF is None:
@@ -97,8 +57,22 @@ def register_callbacks(app):
             if "id" in df.columns:
                 df = df.sort_values(by="id")
 
-        # No Pagination - return all rows
-        return df.to_dict("records")
+        # Pagination
+        if page_current is None:
+            page_current = 0
+        if page_size is None or page_size <= 0:
+            page_size = 50
+
+        total_rows = len(df)
+        page_count = math.ceil(total_rows / page_size) if total_rows else 0
+        if page_count == 0:
+            return [], 0, 0
+        if page_current >= page_count:
+            page_current = max(page_count - 1, 0)
+
+        start = page_current * page_size
+        end = start + page_size
+        return df.iloc[start:end].to_dict("records"), page_count, page_current
 
     @app.callback(
         Output("main-data-store", "data"),
@@ -286,58 +260,177 @@ def register_callbacks(app):
 
     @app.callback(
         Output("metrics-data-store", "data"),
-        Input("main-data-store", "data"),
+        Input("jobs-table", "selected_rows"),
+        State("jobs-table", "data"),
         State("variable-dropdown", "value"),
     )
-    def calculate_metrics_data(data, selected_variables):
-        if not data or not selected_variables:
+    def calculate_metrics_data(selected_rows, jobs_table_data, selected_variables):
+        """
+        Loads pre-calculated metrics from HDF5 summary table.
+        Merges with job parameters for display.
+        """
+        if not H5_FILE or not jobs_table_data:
             return None
-        df_wide = pd.DataFrame(data)
-        metrics_data = []
-        for job_id in df_wide["job_id"].unique():
-            try:
-                params, row_data = JOBS_DF[JOBS_DF["id"] == job_id].iloc[0], {}
-                row_data.update(params.to_dict())
-                row_data["id"] = job_id
-                row_data["Job"] = (
-                    f"Job {job_id} ({', '.join([f'{k}={v}' for k, v in params.drop('id').items()])})"
-                )
-                job_df, time_series = (
-                    df_wide[df_wide["job_id"] == job_id],
-                    df_wide[df_wide["job_id"] == job_id]["time"],
-                )
-                for variable in selected_variables:
-                    series = job_df[variable].dropna()
-                    if series.empty:
-                        continue
-                    aligned_time = time_series.loc[series.index]
-                    # Store as numeric types for plots, they will be formatted in the table if needed or we keep precision
-                    # Actually for the metrics summary table, strings are fine, but for plots we need numbers.
-                    # The metrics-data-store is used for both. Let's store as numbers. The table will display them as is or we format there.
-                    # Or simpler: we store as numbers here, and rely on Dash DataTable formatting (if defined) or default float display.
 
-                    row_data[f"{variable}_Final Value (g)"] = metric.get_final_value(
-                        series
+        if not selected_rows:
+            return []
+
+        try:
+            # get selected job IDs from the current table view
+            selected_jobs = [
+                jobs_table_data[idx]
+                for idx in selected_rows
+                if idx < len(jobs_table_data)
+            ]
+            job_ids = [
+                row.get("id") for row in selected_jobs if row.get("id") is not None
+            ]
+
+            if not job_ids:
+                return []
+
+            # Load summary metrics directly
+            summary_records = load_summary_data(H5_FILE, job_ids)
+
+            # --- Fallback Logic ---
+            if not summary_records:
+                print("No /summary table found. Calculating metrics on-the-fly...")
+                if not selected_variables:
+                    return []
+
+                # Load Time Series Data
+                # Note: This can be expensive for large datasets
+                try:
+                    # Sanitize job_ids
+                    jids_numeric = [int(jid) for jid in job_ids]
+                    df_wide = pd.read_hdf(
+                        H5_FILE,
+                        "results",
+                        where=f"job_id in {jids_numeric}",
+                        columns=list(set(["time", "job_id"] + selected_variables)),
                     )
-                    row_data[f"{variable}_Startup Inventory (g)"] = (
-                        metric.calculate_startup_inventory(series)
-                    )
+                except Exception as e:
+                    print(f"Fallback loading failed: {e}")
+                    return []
+
+                # Calculate Metrics
+                metrics_data = []
+                params_lookup = {
+                    int(row["id"]): row
+                    for row in selected_jobs
+                    if row.get("id") is not None
+                }
+
+                for job_id in df_wide["job_id"].unique():
                     try:
-                        row_data[f"{variable}_Self-sufficient Time (h)"] = (
-                            metric.time_of_turning_point(series, aligned_time)
+                        job_id_int = int(job_id)
+                        if job_id_int not in params_lookup:
+                            continue
+
+                        # Init Row with Params
+                        row_data = params_lookup[job_id_int].copy()
+                        display_params = {
+                            k: v
+                            for k, v in row_data.items()
+                            if k != "id" and k != "job_id"
+                        }
+                        row_data["Job"] = (
+                            f"Job {job_id_int} ({', '.join([f'{k}={v}' for k, v in display_params.items()])})"
                         )
-                    except:
-                        row_data[f"{variable}_Self-sufficient Time (h)"] = None
-                    try:
-                        row_data[f"{variable}_Doubling Time (days)"] = (
-                            metric.calculate_doubling_time(series, aligned_time) / 24
-                        )
-                    except:
-                        row_data[f"{variable}_Doubling Time (days)"] = None
-                metrics_data.append(row_data)
-            except Exception as e:
-                print(f"Error calculating metrics for job {job_id}: {e}")
-        return metrics_data
+
+                        # Calculation
+                        job_df = df_wide[df_wide["job_id"] == job_id]
+                        time_series = job_df["time"]
+
+                        for variable in selected_variables:
+                            if variable not in job_df.columns:
+                                continue
+                            series = job_df[variable].dropna()
+                            if series.empty:
+                                continue
+
+                            aligned_time = time_series.loc[series.index]
+
+                            # Calculate Standard Metrics
+                            row_data[f"{variable} Final Value"] = (
+                                metric.get_final_value(series)
+                            )
+                            row_data[f"{variable} Startup Inventory"] = (
+                                metric.calculate_startup_inventory(series)
+                            )
+                            try:
+                                row_data[f"{variable} Self-sufficient Time"] = (
+                                    metric.time_of_turning_point(series, aligned_time)
+                                )
+                            except:
+                                row_data[f"{variable} Self-sufficient Time"] = None
+                            try:
+                                row_data[f"{variable} Doubling Time"] = (
+                                    metric.calculate_doubling_time(series, aligned_time)
+                                    / 24
+                                )
+                            except:
+                                row_data[f"{variable} Doubling Time"] = None
+
+                        metrics_data.append(row_data)
+                    except Exception as e:
+                        print(f"Error calculating metrics for job {job_id}: {e}")
+
+                return metrics_data
+
+            # --- Success Logic (Existing) ---
+            summary_df = pd.DataFrame(summary_records)
+
+            # Merge with parameters for display context
+            metrics_data = []
+
+            # We want to iterate over the jobs in the table order probably,
+            # but summary_df usually returns in job_id order or storage order.
+
+            # Create a lookup for parameters
+            # Force IDs to int to ensure matching succeeds despite format differences (int vs float vs str)
+            params_lookup = {}
+            for row in selected_jobs:
+                try:
+                    rid = int(row.get("id"))
+                    params_lookup[rid] = row
+                except:
+                    continue
+
+            for _, metric_row in summary_df.iterrows():
+                try:
+                    raw_jid = metric_row.get("job_id")
+                    job_id = int(raw_jid)
+                except:
+                    continue
+
+                if job_id not in params_lookup:
+                    continue
+
+                table_row = params_lookup[job_id].copy()
+
+                # Format Job Title
+                # Remove internal id for display params
+                display_params = {
+                    k: v for k, v in table_row.items() if k != "id" and k != "job_id"
+                }
+                table_row["Job"] = (
+                    f"Job {job_id} ({', '.join([f'{k}={v}' for k, v in display_params.items()])})"
+                )
+
+                # Update with metric values
+                # metric_row has job_id, MetricA, MetricB...
+                for k, v in metric_row.items():
+                    if k != "job_id":
+                        table_row[k] = v
+
+                metrics_data.append(table_row)
+
+            return metrics_data
+
+        except Exception as e:
+            print(f"Error loading metrics summary: {e}")
+            return None
 
     @app.callback(
         Output("metrics-summary-table", "data"),
@@ -573,39 +666,74 @@ def register_callbacks(app):
         return render_log_content(data)
 
     @app.callback(
-        Output("jobs-table", "selected_rows"),
+        Output("selected-job-ids-store", "data"),
         Output("selection-alert", "is_open"),
         Output("selection-alert", "children"),
         Input("select-all-checkbox", "value"),
-        State("jobs-table", "derived_virtual_row_ids"),
-        State("jobs-table", "derived_virtual_data"),
+        Input("jobs-table", "selected_rows"),
         State("jobs-table", "data"),
+        State("selected-job-ids-store", "data"),
         prevent_initial_call=True,
     )
-    def update_selection(
-        select_all_checked, virtual_row_ids, virtual_data, current_data
+    def update_selection_store(
+        select_all_checked, selected_rows, current_data, selected_job_ids
     ):
-        """Select all rows when the safe checkbox is checked.
-        Returns a list of row indices (selected_rows) instead of IDs.
-        """
-        if not select_all_checked:
+        """Update selected job IDs based on current page selection or select-all checkbox."""
+        if not current_data:
             return [], False, ""
-        # Determine which rows are currently displayed (after filtering/pagination)
-        target_data = current_data or virtual_data
-        if not target_data:
-            return [], False, ""
-        # Use the length of the displayed data to generate indices
-        row_count = len(target_data)
-        all_indices = list(range(row_count))
-        # Safety limit to avoid performance issues
-        SAFE_LIMIT = 50
-        if row_count > SAFE_LIMIT:
-            return (
-                all_indices[:SAFE_LIMIT],
-                True,
-                f"Safety Limit: Only the first {SAFE_LIMIT} jobs were selected to prevent performance issues.",
-            )
-        return all_indices, False, ""
+
+        selected_job_ids = selected_job_ids or []
+        selected_set = set(selected_job_ids)
+
+        if ctx.triggered_id == "select-all-checkbox":
+            page_ids = [
+                row.get("id") for row in current_data if row.get("id") is not None
+            ]
+            if select_all_checked:
+                selected_set.update(page_ids)
+            else:
+                for jid in page_ids:
+                    selected_set.discard(jid)
+            return list(selected_set), False, ""
+
+        # Triggered by table selection changes
+        if selected_rows is None:
+            return list(selected_set), False, ""
+
+        page_ids = [row.get("id") for row in current_data if row.get("id") is not None]
+        selected_page_ids = {
+            current_data[idx].get("id")
+            for idx in selected_rows
+            if idx < len(current_data)
+        }
+
+        # Remove any ids from this page, then add current page selection
+        for jid in page_ids:
+            selected_set.discard(jid)
+        selected_set.update([jid for jid in selected_page_ids if jid is not None])
+
+        return list(selected_set), False, ""
+
+    @app.callback(
+        Output("jobs-table", "selected_rows"),
+        Output("select-all-checkbox", "value"),
+        Input("jobs-table", "data"),
+        Input("selected-job-ids-store", "data"),
+    )
+    def sync_selection_with_page(current_data, selected_job_ids):
+        """Sync selected rows and checkbox state when pagination changes."""
+        if not current_data:
+            return [], False
+
+        selected_set = set(selected_job_ids or [])
+        selected_rows = [
+            idx for idx, row in enumerate(current_data) if row.get("id") in selected_set
+        ]
+
+        page_ids = [row.get("id") for row in current_data if row.get("id") is not None]
+        all_selected = bool(page_ids) and all(jid in selected_set for jid in page_ids)
+
+        return selected_rows, all_selected
 
     @app.callback(
         Output("baseline-details-offcanvas", "is_open"),

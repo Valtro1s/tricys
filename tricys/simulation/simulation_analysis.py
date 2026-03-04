@@ -10,6 +10,7 @@ import pandas as pd
 
 from tricys.analysis.metric import (
     calculate_doubling_time,
+    calculate_single_job_metrics,
     calculate_startup_inventory,
     extract_metrics,
     time_of_turning_point,
@@ -291,6 +292,11 @@ def run_simulation(config: Dict[str, Any]) -> None:
 
     from tricys.utils.log_capture import LogCapture
 
+    # Get metrics definition for summary calculation
+    metrics_definition = config.get("sensitivity_analysis", {}).get(
+        "metrics_definition", {}
+    )
+
     # Capture logs for HDF5 storage
     with LogCapture() as log_handler:
         try:
@@ -339,6 +345,55 @@ def run_simulation(config: Dict[str, Any]) -> None:
                         except Exception as e:
                             logger.error(f"HDF5 write failed for job {job_id}: {e}")
 
+                    # Calculate and Save Summary Metrics
+                    if res_path and os.path.exists(res_path) and metrics_definition:
+                        try:
+                            # We need to re-read df if not available (it IS available above, but scoped inside try)
+                            # Simplified: just read again or reuse if variable scope allows.
+                            # Variable 'df' is local to try block above.
+                            # Let's read clean instance to be safe
+                            df_metric = pd.read_csv(res_path)
+
+                            single_job_metrics = calculate_single_job_metrics(
+                                df_metric, metrics_definition
+                            )
+
+                            if single_job_metrics:
+                                # Convert to DataFrame for HDF5 storage
+                                # Format: job_id | metric_name | metric_value
+                                summary_rows = []
+                                for m_name, m_val in single_job_metrics.items():
+                                    if m_val is not None:
+                                        summary_rows.append(
+                                            {
+                                                "job_id": job_id,
+                                                "metric_name": m_name,
+                                                "metric_value": float(m_val),
+                                            }
+                                        )
+
+                                if summary_rows:
+                                    summary_df = pd.DataFrame(summary_rows)
+                                    # Ensure types
+                                    summary_df["metric_name"] = summary_df[
+                                        "metric_name"
+                                    ].astype(str)
+                                    summary_df["metric_value"] = summary_df[
+                                        "metric_value"
+                                    ].astype(float)
+
+                                    store.append(
+                                        "summary",
+                                        summary_df,
+                                        index=False,
+                                        data_columns=True,
+                                    )
+
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to calculate/save summary metrics for job {job_id}: {e}"
+                            )
+
                     # Collect Summary
                     entry = params.copy()
                     entry.update(opts)
@@ -358,23 +413,35 @@ def run_simulation(config: Dict[str, Any]) -> None:
                     wrapper = _co_sim_runner_wrapper
 
                 # Run Execution
+                # Counter for progress logging
+                completed_count = 0
+                total_jobs = len(jobs)
+
                 if use_concurrent:
                     with multiprocessing.Pool(max_workers) as pool:
                         for job_id, parsed_params, res_data, err in pool.imap_unordered(
                             wrapper, pool_args
                         ):
+                            completed_count += 1
                             if err:
                                 logger.error(f"Job {job_id} failed: {err}")
                             else:
                                 _handle_result(job_id, parsed_params, res_data)
+
+                            # Log progress
+                            logger.info(f"Job {completed_count} of {total_jobs}")
                 else:
                     # Sequential Loop
                     for args in pool_args:
                         job_id, parsed_params, res_data, err = wrapper(args)
+                        completed_count += 1
                         if err:
                             logger.error(f"Job {job_id} failed: {err}")
                         else:
                             _handle_result(job_id, parsed_params, res_data)
+
+                        # Log progress
+                        logger.info(f"Job {completed_count} of {total_jobs}")
 
                 # Save Config and Logs at the end
                 try:
@@ -495,10 +562,19 @@ def _handle_analysis_cases(config: Dict[str, Any]) -> bool:
             )
 
             with multiprocessing.Pool(processes=max_workers) as pool:
+                completed_cases = 0
+                total_cases = len(case_configs)
                 for case_info, success, error in pool.imap_unordered(
                     _mp_execute_analysis_case_wrapper, case_configs
                 ):
+                    completed_cases += 1
                     case_name = case_info["case_data"].get("name", case_info["index"])
+
+                    # Log progress for backend parsing
+                    logger.info(
+                        f"Job {completed_cases} of {total_cases} (Analysis Case: {case_name})"
+                    )
+
                     if error:
                         logger.error(
                             f"Parallel case '{case_name}' failed in executor with: {error}"
@@ -854,6 +930,61 @@ def _run_sensitivity_analysis(
         )
         df_to_save.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
         logger.info(f"Sensitivity analysis summary saved to: {summary_csv_path}")
+
+        # Save summary data to HDF5 as well, for consistency with simulation.py
+        # Save summary data to HDF5 as well, for consistency with simulation.py
+        if os.path.exists(hdf_path):
+            try:
+                with pd.HDFStore(
+                    hdf_path, mode="a", complib="blosc", complevel=9
+                ) as store:
+                    hdf_df = df_to_save.copy()
+
+                    # Attempt to restore job_id if missing, using jobs metadata
+                    if "job_id" not in hdf_df.columns and jobs:
+                        try:
+                            # Reconstruct job mapping from jobs list
+                            job_map = []
+                            for i, job in enumerate(jobs):
+                                entry = job.copy()
+                                entry["job_id"] = i + 1
+                                job_map.append(entry)
+                            job_map_df = pd.DataFrame(job_map)
+
+                            # Identify common parameter columns for merge
+                            # Use all columns from job_map_df except job_id
+                            merge_on = [c for c in job_map_df.columns if c != "job_id"]
+                            # Intersection with hdf_df columns
+                            merge_on = [c for c in merge_on if c in hdf_df.columns]
+
+                            if merge_on:
+                                # Ensure types match for merge (convert to object/float handling if needed)
+                                # Simple merge should work if types consistent
+                                hdf_df = pd.merge(
+                                    hdf_df, job_map_df, on=merge_on, how="left"
+                                )
+                        except Exception as merge_e:
+                            logger.warning(
+                                f"Failed to restore job_id for HDF5 summary: {merge_e}"
+                            )
+
+                    # Force object dtype only for string/object columns to avoid HDF5 issues
+                    for col in hdf_df.select_dtypes(
+                        include=["object", "string"]
+                    ).columns:
+                        hdf_df[col] = hdf_df[col].astype(object)
+
+                    # Store in 'summary' key
+                    # We use format='table' and data_columns=True for consistency and queryability
+                    # This replaces any existing summary to ensure we have the final merged version
+                    store.put("summary", hdf_df, format="table", data_columns=True)
+                    logger.info(
+                        f"Sensitivity analysis summary saved to HDF5: {hdf_path}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save sensitivity analysis summary to HDF5: {e}"
+                )
 
         # Generate analysis charts
         unit_map = analysis_config.get("unit_map", {})
