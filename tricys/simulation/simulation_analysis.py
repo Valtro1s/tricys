@@ -9,10 +9,12 @@ from typing import Any, Dict, List, Union
 import pandas as pd
 
 from tricys.analysis.metric import (
+    build_single_job_summary_df,
     calculate_doubling_time,
     calculate_single_job_metrics,
     calculate_startup_inventory,
     extract_metrics,
+    extract_metrics_from_hdf5,
     time_of_turning_point,
 )
 from tricys.analysis.plot import generate_analysis_plots, plot_sweep_time_series
@@ -310,9 +312,7 @@ def run_simulation(config: Dict[str, Any]) -> None:
                         include=["object", "string"]
                     ).columns:
                         meta_df[col] = meta_df[col].astype(object)
-                    store.put(
-                        "jobs_metadata", meta_df, format="table", data_columns=True
-                    )
+                    store.put("jobs", meta_df, format="table", data_columns=True)
 
                 # Results Handler
                 def _handle_result(job_id, params, result_data):
@@ -324,19 +324,6 @@ def run_simulation(config: Dict[str, Any]) -> None:
                             df = pd.read_csv(res_path)
                             df["job_id"] = job_id
                             store.append("results", df, index=False, data_columns=True)
-
-                            param_df = pd.DataFrame([params])
-                            param_df["job_id"] = job_id
-
-                            # Type safety
-                            for col in param_df.select_dtypes(
-                                include=["object", "string"]
-                            ).columns:
-                                param_df[col] = param_df[col].astype(object)
-
-                            store.append(
-                                "jobs", param_df, index=False, data_columns=True
-                            )
 
                             # Cleanup Job Workspace
                             job_dir = os.path.dirname(res_path)
@@ -359,29 +346,12 @@ def run_simulation(config: Dict[str, Any]) -> None:
                             )
 
                             if single_job_metrics:
-                                # Convert to DataFrame for HDF5 storage
-                                # Format: job_id | metric_name | metric_value
-                                summary_rows = []
-                                for m_name, m_val in single_job_metrics.items():
-                                    if m_val is not None:
-                                        summary_rows.append(
-                                            {
-                                                "job_id": job_id,
-                                                "metric_name": m_name,
-                                                "metric_value": float(m_val),
-                                            }
-                                        )
-
-                                if summary_rows:
-                                    summary_df = pd.DataFrame(summary_rows)
-                                    # Ensure types
-                                    summary_df["metric_name"] = summary_df[
-                                        "metric_name"
-                                    ].astype(str)
-                                    summary_df["metric_value"] = summary_df[
-                                        "metric_value"
-                                    ].astype(float)
-
+                                summary_df = build_single_job_summary_df(
+                                    job_id,
+                                    single_job_metrics,
+                                    metrics_definition,
+                                )
+                                if not summary_df.empty:
                                     store.append(
                                         "summary",
                                         summary_df,
@@ -717,91 +687,7 @@ def _extract_metrics_from_hdf5(
 ) -> pd.DataFrame:
     """Extracts metrics from HDF5 file iteratively to save memory."""
     try:
-        jobs_df = pd.read_hdf(hdf_path, "jobs_metadata")
-        all_results = []
-
-        # We need to process job by job
-        # To make it efficient, we can't easily query row by row if not indexed.
-        # But 'results' table is appendable. We can iterate it in chunks or by job_id if indexed.
-        # Given the structure, reading the whole table is bad.
-        # We can use 'where' clause if indexed, or iterator.
-        # Assuming job_id is not indexed in file creation yet (it should be for perf),
-        # but let's assume we can read chunks.
-        # Actually, for correctness and simplicity in this refactor:
-        # We iterate job_ids. If performance is slow, we can optimize later.
-
-        # Optimize: Read chunks of results, group by job_id in memory, process.
-        # But results for one job might be split across chunks? Unlikely if appended sequentially.
-        # Safe approach: Read by job_id using 'where' (slow if not indexed) or read full table in chunks?
-        # If we can't fully read table, we must rely on 'select'.
-
-        store = pd.HDFStore(hdf_path, mode="r")
-        try:
-            if "job_id" in store.select("results", start=0, stop=1).columns:
-                # We can't easily check index status without accessing pytables object,
-                # but we can just try selecting.
-                pass
-        except:
-            pass
-        store.close()
-
-        total_jobs = len(jobs_df)
-        logger.info(f"Extracting metrics from HDF5 for {total_jobs} jobs...")
-
-        for idx, job_row in jobs_df.iterrows():
-            job_id = job_row["job_id"]
-            # Reconstruct params dict
-            job_params = job_row.drop("job_id").to_dict()
-
-            # Read results for this job
-            # Note: This might be slow for 1.8M jobs if done one by one without index.
-            # But it is memory safe.
-            try:
-                df = pd.read_hdf(hdf_path, "results", where=f"job_id == {job_id}")
-            except ValueError:
-                # Fallback if query fails (e.g. table not indexed/support query)
-                # If cannot query, this strategy fails for huge files.
-                # Assuming 'enhanced' mode indexing or manageable size for now.
-                # Alternative: chunk iterator.
-                logger.warning(f"Could not query job_id={job_id}, skipping.")
-                continue
-
-            if df.empty:
-                continue
-
-            # Create a "wide" dataframe for this single job so extract_metrics works
-            # extract_metrics expects columns like 'var&param=val'
-            param_string = "&".join([f"{k}={v}" for k, v in job_params.items()])
-
-            # Drop metadata cols
-            data_cols = df.drop(columns=["job_id", "time"], errors="ignore")
-
-            rename_map = {
-                col: f"{col}&{param_string}" if param_string else col
-                for col in data_cols.columns
-            }
-            renamed_df = data_cols.rename(columns=rename_map)
-            renamed_df["time"] = df["time"]  # Put time back for metric calc
-
-            # Extract metrics for this single job
-            # extract_metrics returns a pivoted DataFrame (1 row usually)
-            # We want the raw rows before pivot? No, extract_metrics does pivot.
-            # But extract_metrics implementation aggregates a list then makes DF.
-            # If we call it on 1 job, we get 1 row DF.
-            job_metrics_df = extract_metrics(
-                renamed_df, metrics_definition, analysis_case
-            )
-
-            if not job_metrics_df.empty:
-                all_results.append(job_metrics_df)
-
-            if idx % 100 == 0:
-                logger.debug(f"Processed {idx}/{total_jobs} jobs from HDF5")
-
-        if all_results:
-            return pd.concat(all_results, ignore_index=True)
-        else:
-            return pd.DataFrame()
+        return extract_metrics_from_hdf5(hdf_path, metrics_definition, analysis_case)
 
     except Exception as e:
         logger.error(f"Failed to extract metrics from HDF5: {e}")
@@ -1083,10 +969,17 @@ def _execute_analysis_case(case_info: Dict[str, Any]) -> bool:
 
 
 def _run_post_processing(
-    config: Dict[str, Any], results_df: pd.DataFrame, post_processing_output_dir: str
+    config: Dict[str, Any],
+    results_file_path: str,
+    post_processing_output_dir: str,
 ) -> None:
     """Wrapper for simulation.run_post_processing."""
-    run_post_processing(config, results_df, post_processing_output_dir)
+    run_post_processing(
+        config,
+        None,
+        post_processing_output_dir,
+        results_file_path=results_file_path,
+    )
 
 
 def _mp_execute_analysis_case_wrapper(case_info):

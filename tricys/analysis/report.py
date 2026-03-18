@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import openai
 import pandas as pd
 
+from tricys.analysis.hdf5_support import build_dynamic_slices_from_hdf5
 from tricys.utils.config_utils import get_llm_env
 
 logger = logging.getLogger(__name__)
@@ -892,53 +893,29 @@ def generate_prompt_templates(
                 try:
                     logger.info("Loading sweep results for dynamic slicing.")
                     if sweep_results_path.endswith(".h5"):
-                        # Read sample for column detection and slicing
-                        sweep_df = pd.read_hdf(
-                            sweep_results_path, "results", stop=10000
+                        slice_data = build_dynamic_slices_from_hdf5(sweep_results_path)
+                        reference_col_for_turning_point = slice_data.get(
+                            "reference_label"
                         )
+                        start_data = slice_data.get("start_sample_df", pd.DataFrame())
+                        turning_point_data = slice_data.get(
+                            "turning_sample_df", pd.DataFrame()
+                        )
+                        end_data = slice_data.get("end_sample_df", pd.DataFrame())
                     else:
                         sweep_df = pd.read_csv(sweep_results_path)
+                        if "time" in sweep_df.columns and len(sweep_df.columns) > 1:
+                            reference_col_for_turning_point = sweep_df.columns[
+                                len(sweep_df.columns) // 2
+                            ]
 
-                    if "time" in sweep_df.columns and len(sweep_df.columns) > 1:
-                        reference_col_for_turning_point = sweep_df.columns[
-                            len(sweep_df.columns) // 2
-                        ]
-                    if reference_col_for_turning_point:
-                        data_to_slice_df = sweep_df.copy()
-                        data_to_slice_df.reset_index(drop=True, inplace=True)
-                        if not data_to_slice_df.empty:
-                            prompt_lines.append("## 关键动态数据切片：过程数据\n\n")
-                            prompt_lines.append(
-                                f"下表展示了过程数据中，以 `{reference_col_for_turning_point}` 为参考变量，在关键阶段的数据切片。**注意：下表中的默认单位为：时间(h), 库存(g), 功率(MW)。**\n\n"
-                            )
-                            base_var_name = reference_col_for_turning_point.split("&")[
-                                0
-                            ]
-                            cols_to_rename = [
-                                c for c in data_to_slice_df.columns if c != "time"
-                            ]
-                            rename_map = {
-                                col: f"C{i+1}" for i, col in enumerate(cols_to_rename)
-                            }
-                            legend_lines = [
-                                "**表格图例说明**：",
-                                "| 简称 | 参数组合 |",
-                                "| :--- | :--- |",
-                            ]
-                            for original_name, abbr in rename_map.items():
-                                param_parts = original_name.split("&", 1)
-                                param_str = (
-                                    param_parts[1] if len(param_parts) > 1 else "无"
-                                )
-                                param_str_formatted = (
-                                    "`" + "`, `".join(param_str.split("&")) + "`"
-                                )
-                                legend_lines.append(
-                                    f"| **{abbr}** | {param_str_formatted} |"
-                                )
-                            base_var_info = f"**注**：表格中所有简称列（C1, C2, ...）的数据均代表变量 `{base_var_name}` 在不同参数组合下的值。\n"
-                            legend_md = base_var_info + "\n".join(legend_lines) + "\n\n"
-                            prompt_lines.append(legend_md)
+                        start_data = pd.DataFrame()
+                        turning_point_data = pd.DataFrame()
+                        end_data = pd.DataFrame()
+
+                        if reference_col_for_turning_point:
+                            data_to_slice_df = sweep_df.copy()
+                            data_to_slice_df.reset_index(drop=True, inplace=True)
                             primary_y_var = reference_col_for_turning_point
                             min_idx = -1
                             if primary_y_var in data_to_slice_df.columns:
@@ -949,15 +926,6 @@ def generate_prompt_templates(
                             window_size = (num_points - 1) * interval + 1
                             start_data = data_to_slice_df.iloc[:window_size:interval]
                             end_data = data_to_slice_df.iloc[-(window_size)::interval]
-                            prompt_lines.append(
-                                f"### 1. 初始阶段 (前 {num_points} 个数据点, 间隔 {interval})\n"
-                            )
-                            prompt_lines.append(
-                                start_data.rename(columns=rename_map).to_markdown(
-                                    index=False
-                                )
-                                + "\n\n"
-                            )
                             if min_idx != -1:
                                 window_radius_indices = (num_points // 2) * interval
                                 start_idx = max(0, min_idx - window_radius_indices)
@@ -968,24 +936,61 @@ def generate_prompt_templates(
                                 turning_point_data = data_to_slice_df.iloc[
                                     start_idx:end_idx:interval
                                 ]
-                                prompt_lines.append(
-                                    f"### 2. 转折点阶段 (围绕 '{primary_y_var}' 最小值)\n"
-                                )
-                                prompt_lines.append(
-                                    turning_point_data.rename(
-                                        columns=rename_map
-                                    ).to_markdown(index=False)
-                                    + "\n\n"
-                                )
+
+                    if reference_col_for_turning_point and not start_data.empty:
+                        prompt_lines.append("## 关键动态数据切片：过程数据\n\n")
+                        prompt_lines.append(
+                            f"下表展示了过程数据中，以 `{reference_col_for_turning_point}` 为参考变量，在关键阶段的数据切片。**注意：下表中的默认单位为：时间(h), 库存(g), 功率(MW)。**\n\n"
+                        )
+                        base_var_name = reference_col_for_turning_point.split("&")[0]
+                        cols_to_rename = [c for c in start_data.columns if c != "time"]
+                        rename_map = {
+                            col: f"C{i+1}" for i, col in enumerate(cols_to_rename)
+                        }
+                        legend_lines = [
+                            "**表格图例说明**：",
+                            "| 简称 | 参数组合 |",
+                            "| :--- | :--- |",
+                        ]
+                        for original_name, abbr in rename_map.items():
+                            param_parts = original_name.split("&", 1)
+                            param_str = param_parts[1] if len(param_parts) > 1 else "无"
+                            param_str_formatted = (
+                                "`" + "`, `".join(param_str.split("&")) + "`"
+                            )
+                            legend_lines.append(
+                                f"| **{abbr}** | {param_str_formatted} |"
+                            )
+                        base_var_info = f"**注**：表格中所有简称列（C1, C2, ...）的数据均代表变量 `{base_var_name}` 在不同参数组合下的值。\n"
+                        prompt_lines.append(
+                            base_var_info + "\n".join(legend_lines) + "\n\n"
+                        )
+                        prompt_lines.append(
+                            "### 1. 初始阶段 (前 20 个数据点, 间隔 2)\n"
+                        )
+                        prompt_lines.append(
+                            start_data.rename(columns=rename_map).to_markdown(
+                                index=False
+                            )
+                            + "\n\n"
+                        )
+                        if not turning_point_data.empty:
                             prompt_lines.append(
-                                f"### 3. 结束阶段 (后 {num_points} 个数据点, 间隔 {interval})\n"
+                                f"### 2. 转折点阶段 (围绕 '{reference_col_for_turning_point}' 最小值)\n"
                             )
                             prompt_lines.append(
-                                end_data.rename(columns=rename_map).to_markdown(
-                                    index=False
-                                )
+                                turning_point_data.rename(
+                                    columns=rename_map
+                                ).to_markdown(index=False)
                                 + "\n\n"
                             )
+                        prompt_lines.append(
+                            "### 3. 结束阶段 (后 20 个数据点, 间隔 2)\n"
+                        )
+                        prompt_lines.append(
+                            end_data.rename(columns=rename_map).to_markdown(index=False)
+                            + "\n\n"
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Could not generate dynamic data slices for case {case_name}: {e}"
@@ -1373,7 +1378,16 @@ def _retry_standard_case(
             summary_df = pd.read_csv(summary_csv_path)
             reference_col_for_turning_point = None
             sweep_csv_path = os.path.join(case_results_dir, "sweep_results.csv")
-            if case_data.get("sweep_time") and os.path.exists(sweep_csv_path):
+            sweep_h5_path = os.path.join(case_results_dir, "sweep_results.h5")
+            if case_data.get("sweep_time") and os.path.exists(sweep_h5_path):
+                try:
+                    slice_data = build_dynamic_slices_from_hdf5(sweep_h5_path)
+                    reference_col_for_turning_point = slice_data.get("reference_label")
+                except Exception as e:
+                    logger.warning(
+                        f"Could not determine reference_col_for_turning_point for retry: {e}"
+                    )
+            elif case_data.get("sweep_time") and os.path.exists(sweep_csv_path):
                 try:
                     sweep_df = pd.read_csv(sweep_csv_path)
                     if "time" in sweep_df.columns and len(sweep_df.columns) > 1:

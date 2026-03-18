@@ -4,6 +4,8 @@ import os
 
 import pandas as pd
 
+from tricys.utils.hdf5_schema import RESULTS_KEY, SUMMARY_KEY, get_jobs_key
+
 
 def inspect_h5(file_path, job_id=None):
     if not os.path.exists(file_path):
@@ -14,6 +16,11 @@ def inspect_h5(file_path, job_id=None):
         with pd.HDFStore(file_path, mode="r") as store:
             print(f"=== HDF5 Inspect: {os.path.basename(file_path)} ===")
             keys = store.keys()
+            jobs_key = None
+            try:
+                jobs_key = get_jobs_key(store)
+            except KeyError:
+                jobs_key = None
 
             if "/config" in keys:
                 print("\n--- Config info ---")
@@ -59,14 +66,14 @@ def inspect_h5(file_path, job_id=None):
                 except Exception as e:
                     print(f"Error reading logs: {e}")
 
-            if "/jobs" in keys:
+            if jobs_key is not None:
                 print("\n--- Jobs info ---")
                 if job_id is not None:
                     # Query specific job parameters
                     try:
-                        jobs_df = store.select("jobs", where=f"job_id == {job_id}")
+                        jobs_df = store.select(jobs_key, where=f"job_id == {job_id}")
                         if jobs_df.empty:
-                            print(f"Job {job_id} not found in 'jobs' table.")
+                            print(f"Job {job_id} not found in '{jobs_key}' table.")
                         else:
                             print(f"Parameters for Job {job_id}:")
                             print(jobs_df.transpose().to_string())
@@ -74,20 +81,20 @@ def inspect_h5(file_path, job_id=None):
                         print(f"Error querying job {job_id}: {e}")
                 else:
                     try:
-                        nrows = store.get_storer("jobs").nrows
+                        nrows = store.get_storer(jobs_key).nrows
                         print(f"Total jobs: {nrows}")
                         print("First 5 jobs:")
-                        print(store.select("jobs", stop=5).to_string())
+                        print(store.select(jobs_key, stop=5).to_string())
                     except:
                         pass
 
-            if "/results" in keys:
+            if f"/{RESULTS_KEY}" in keys:
                 print("\n--- Results info ---")
                 if job_id is not None:
                     # Query specific job results
                     try:
                         results_df = store.select(
-                            "results", where=f"job_id == {job_id}"
+                            RESULTS_KEY, where=f"job_id == {job_id}"
                         )
                         if results_df.empty:
                             print(f"No results found for Job {job_id}.")
@@ -100,12 +107,21 @@ def inspect_h5(file_path, job_id=None):
                         print(f"Error querying results for job {job_id}: {e}")
                 else:
                     try:
-                        nrows = store.get_storer("results").nrows
+                        nrows = store.get_storer(RESULTS_KEY).nrows
                         print(f"Total result rows: {nrows}")
                         print("First 5 rows:")
-                        print(store.select("results", stop=5).to_string())
+                        print(store.select(RESULTS_KEY, stop=5).to_string())
                     except:
                         pass
+
+            if f"/{SUMMARY_KEY}" in keys:
+                print("\n--- Summary info ---")
+                try:
+                    summary_df = store.select(SUMMARY_KEY, stop=5)
+                    print(f"Summary columns: {list(summary_df.columns)}")
+                    print(summary_df.to_string())
+                except Exception as e:
+                    print(f"Error reading summary: {e}")
 
             if not keys:
                 print("File is empty.")

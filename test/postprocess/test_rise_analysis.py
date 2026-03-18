@@ -11,6 +11,12 @@ from tricys.postprocess.rise_analysis import analyze_rise_dip
 TEST_DIR = "temp_rise_analysis_test"
 
 
+def create_hdf5_fixture(file_path, jobs_df, results_df):
+    with pd.HDFStore(file_path, mode="w") as store:
+        store.put("jobs", jobs_df, format="table", data_columns=True)
+        store.append("results", results_df, index=False, data_columns=True)
+
+
 @pytest.fixture(autouse=True)
 def setup_and_teardown_test_dir():
     """Fixture to create and cleanup the test directory for each test."""
@@ -28,13 +34,17 @@ def setup_and_teardown_test_dir():
 @pytest.mark.build_test
 def test_analyze_rise_dip_feature_present():
     """Tests that a 'dip and rise' feature is correctly detected."""
+    h5_path = os.path.join(TEST_DIR, "results.h5")
+    jobs_df = pd.DataFrame({"job_id": [1], "p": ["A"]})
     df = pd.DataFrame(
         {
             "time": [0, 10, 20, 30, 40],
-            "var&p=A": [100, 80, 75, 85, 110],  # clear dip and rise
+            "var": [100, 80, 75, 85, 110],
+            "job_id": [1, 1, 1, 1, 1],
         }
     )
-    analyze_rise_dip(df, TEST_DIR)
+    create_hdf5_fixture(h5_path, jobs_df, df)
+    analyze_rise_dip(h5_path, TEST_DIR)
 
     report_path = os.path.join(TEST_DIR, "rise_report.json")
     assert os.path.exists(report_path)
@@ -49,13 +59,17 @@ def test_analyze_rise_dip_feature_present():
 @pytest.mark.build_test
 def test_analyze_rise_dip_feature_absent_monotonic():
     """Tests that a monotonic decrease is not flagged as 'dip and rise'."""
+    h5_path = os.path.join(TEST_DIR, "results.h5")
+    jobs_df = pd.DataFrame({"job_id": [1], "p": ["B"]})
     df = pd.DataFrame(
         {
             "time": [0, 10, 20, 30, 40],
-            "var&p=B": [100, 90, 80, 70, 60],  # monotonic decrease
+            "var": [100, 90, 80, 70, 60],
+            "job_id": [1, 1, 1, 1, 1],
         }
     )
-    analyze_rise_dip(df, TEST_DIR)
+    create_hdf5_fixture(h5_path, jobs_df, df)
+    analyze_rise_dip(h5_path, TEST_DIR)
 
     report_path = os.path.join(TEST_DIR, "rise_report.json")
     assert os.path.exists(report_path)
@@ -70,14 +84,17 @@ def test_analyze_rise_dip_feature_absent_monotonic():
 @pytest.mark.build_test
 def test_analyze_rise_dip_multiple_curves():
     """Tests analysis with multiple curves, one with and one without the feature."""
+    h5_path = os.path.join(TEST_DIR, "results.h5")
+    jobs_df = pd.DataFrame({"job_id": [1, 2], "p": ["A", "B"]})
     df = pd.DataFrame(
         {
-            "time": [0, 10, 20, 30, 40],
-            "var&p=A": [100, 80, 75, 85, 110],  # with rise
-            "var&p=B": [100, 90, 80, 70, 60],  # without rise
+            "time": [0, 10, 20, 30, 40, 0, 10, 20, 30, 40],
+            "var": [100, 80, 75, 85, 110, 100, 90, 80, 70, 60],
+            "job_id": [1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
         }
     )
-    analyze_rise_dip(df, TEST_DIR)
+    create_hdf5_fixture(h5_path, jobs_df, df)
+    analyze_rise_dip(h5_path, TEST_DIR)
 
     report_path = os.path.join(TEST_DIR, "rise_report.json")
     assert os.path.exists(report_path)

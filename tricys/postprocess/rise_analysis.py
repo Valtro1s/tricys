@@ -4,108 +4,116 @@ import os
 
 import pandas as pd
 
+from tricys.utils.hdf5_schema import RESULTS_KEY, get_jobs_key
+
 logger = logging.getLogger(__name__)
 
 
-def analyze_rise_dip(results_df: pd.DataFrame, output_dir: str, **kwargs) -> None:
-    """Analyzes parameter sweep results to identify curves that fail to exhibit 'dip and rise' feature.
-
-    A curve exhibits the 'dip and rise' feature if:
-    1. It has a clear minimum point (not at boundaries)
-    2. Values at both start and end are higher than the minimum (with tolerance)
+def analyze_rise_dip(results_file_path: str, output_dir: str, **kwargs) -> None:
+    """Analyzes HDF5 simulation results to identify curves that fail to exhibit 'dip and rise' feature.
 
     Args:
-        results_df: The combined DataFrame of simulation results, including time and
-            multiple parameter combinations.
+        results_file_path: Path to the HDF5 file containing 'results' and 'jobs' tables.
         output_dir: The directory to save the analysis report.
-        **kwargs: Additional parameters from config, e.g., 'output_filename'.
-
-    Note:
-        Uses 0.1% smoothing window to handle noisy data. Column names expected in
-        format 'variable&param1=v1&param2=v2'. Logs ERROR for each curve without
-        the feature. Always generates rise_report.json with analysis results for
-        all curves, including 'rises' boolean flag.
+        **kwargs: Additional parameters.
     """
-    logger.info("Starting post-processing: Analyzing curve rise/dip features...")
+    logger.info("Starting HDF5 post-processing: Analyzing curve rise/dip features...")
     all_curves_info = []
     error_count = 0
 
-    # Iterate over each column of the DataFrame (except for the 'time' column)
-    for col_name in results_df.columns:
-        if col_name == "time":
-            continue
+    if not os.path.exists(results_file_path):
+        logger.error(f"Results file not found: {results_file_path}")
+        return
 
-        # Parse parameters from the column name 'variable&param1=v1&param2=v2'
-        try:
-            parts = col_name.split("&")
-            if len(parts) < 2:  # Must have at least one variable name and one parameter
-                logger.warning(
-                    f"Column name '{col_name}' has an incorrect format, skipping."
-                )
-                continue
+    try:
+        with pd.HDFStore(results_file_path, mode="r") as store:
+            if f"/{RESULTS_KEY}" not in store.keys():
+                logger.error("HDF5 file missing 'results' table.")
+                return
 
-            # parts[0] is the variable name, parse parameters from parts[1:]
-            param_parts = parts[1:]
-            job_params = dict(item.split("=") for item in param_parts)
-            job_params["variable"] = parts[
-                0
-            ]  # Also add the original variable name to the info
+            try:
+                jobs_key = get_jobs_key(store)
+            except KeyError:
+                logger.error("HDF5 file missing 'jobs' table.")
+                return
 
-        except (ValueError, IndexError):
-            logger.warning(
-                f"Could not parse parameters from column name '{col_name}', skipping."
-            )
-            continue
+            jobs_df = store.select(jobs_key)
+            jobs_map = jobs_df.set_index("job_id").to_dict(orient="index")
+            job_ids = sorted(jobs_map.keys())
 
-        series = results_df[col_name]
-        rises = False
-        if len(series) > 2:
-            # This logic is inspired by `time_of_turning_point` from `tricys/analysis/metric.py`.
-            # It uses a smoothed series to determine if there is a 'dip and rise' trend.
-            window_size = max(1, int(len(series) * 0.001))  # 0.1% smoothing window
-            smoothed = series.rolling(
-                window=window_size, center=True, min_periods=1
-            ).mean()
+            def check_curve(series, job_params, var_name):
+                rises = False
+                if len(series) > 2:
+                    window_size = max(1, int(len(series) * 0.001))
+                    smoothed = series.rolling(
+                        window=window_size, center=True, min_periods=1
+                    ).mean()
 
-            min_pos_index = smoothed.idxmin()
-            min_val = smoothed.loc[min_pos_index]
+                    min_pos_index = smoothed.idxmin()
+                    min_val = smoothed.loc[min_pos_index]
+                    is_min_at_boundary = (min_pos_index == smoothed.index[0]) or (
+                        min_pos_index == smoothed.index[-1]
+                    )
 
-            logger.info(
-                f"Analyzing curve '{col_name}': min at index {min_pos_index} with value {min_val}"
-            )
+                    if not is_min_at_boundary:
+                        series_range = smoothed.max() - smoothed.min()
+                        tolerance = series_range * 0.001 if series_range > 1e-9 else 0
+                        start_val = smoothed.iloc[0]
+                        end_val = smoothed.iloc[-1]
 
-            # Check if the minimum is at the beginning or end of the series
-            is_min_at_boundary = (min_pos_index == smoothed.index[0]) or (
-                min_pos_index == smoothed.index[-1]
-            )
+                        if (
+                            start_val > min_val + tolerance
+                            and end_val > min_val + tolerance
+                        ):
+                            rises = True
 
-            if not is_min_at_boundary:
-                # Check if it dips from the start and rises to the end.
-                # A small tolerance is used to avoid issues with noise.
-                series_range = smoothed.max() - smoothed.min()
-                # Avoid division by zero or NaN tolerance if series is flat
-                if series_range > 1e-9:
-                    tolerance = series_range * 0.001  # 0.1% of range as tolerance
-                else:
-                    tolerance = 0
+                info = job_params.copy()
+                info["variable"] = var_name
+                info["rises"] = rises
+                return info, rises
 
-                start_val = smoothed.iloc[0]
-                end_val = smoothed.iloc[-1]
+            batch_size = 100
+            total_jobs = len(job_ids)
 
-                if start_val > min_val + tolerance and end_val > min_val + tolerance:
-                    rises = True
+            for i in range(0, total_jobs, batch_size):
+                batch_ids = job_ids[i : i + batch_size]
+                min_id = min(batch_ids)
+                max_id = max(batch_ids)
 
-        # Record the analysis result for every curve
-        info = job_params.copy()
-        info["rises"] = bool(rises)
-        all_curves_info.append(info)
+                try:
+                    res_batch = store.select(
+                        RESULTS_KEY,
+                        where=f"job_id >= {min_id} & job_id <= {max_id}",
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to load batch {min_id}-{max_id}: {e}")
+                    continue
 
-        # If the feature is not detected, log it at the ERROR level
-        if not rises:
-            error_count += 1
-            logger.error(
-                f"Feature not detected: 'Dip and rise' feature was not found for the curve with parameters {job_params}."
-            )
+                grouped = res_batch.groupby("job_id")
+
+                for j_id, group in grouped:
+                    if j_id not in jobs_map:
+                        continue
+
+                    params = jobs_map[j_id]
+
+                    for col in group.columns:
+                        if col in ["time", "job_id"]:
+                            continue
+
+                        info, rises = check_curve(
+                            group[col].reset_index(drop=True), params, col
+                        )
+                        all_curves_info.append(info)
+
+                        if not rises:
+                            error_count += 1
+                            logger.error(
+                                f"Feature not detected for Job {j_id}, Var '{col}' (Params: {params})"
+                            )
+
+    except Exception as e:
+        logger.error(f"HDF5 processing failed: {e}", exc_info=True)
 
     # Generate a report file with all information unconditionally
     output_filename = kwargs.get("output_filename", "rise_report.json")
@@ -115,10 +123,6 @@ def analyze_rise_dip(results_df: pd.DataFrame, output_dir: str, **kwargs) -> Non
         json.dump(all_curves_info, f, indent=4, ensure_ascii=False)
 
     if error_count > 0:
-        logger.info(
-            f"{error_count} curves did not exhibit the expected feature. See report for details: {report_path}"
-        )
+        logger.info(f"{error_count} curves failed checks. Report: {report_path}")
     else:
-        logger.info(
-            f"All curves exhibit the expected 'dip and rise' feature. Report generated at: {report_path}"
-        )
+        logger.info(f"All curves passed. Report: {report_path}")

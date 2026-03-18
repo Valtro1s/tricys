@@ -24,7 +24,10 @@ except ImportError:
 import pandas as pd
 from OMPython import ModelicaSystem
 
-from tricys.analysis.metric import calculate_single_job_metrics
+from tricys.analysis.metric import (
+    build_single_job_summary_df,
+    calculate_single_job_metrics,
+)
 from tricys.core.interceptor import integrate_interceptor_model
 from tricys.core.jobs import generate_simulation_jobs
 from tricys.core.modelica import (
@@ -704,17 +707,11 @@ def _process_h5_result(
                 )
 
                 if single_job_metrics:
-                    # Store in Wide Format (Table style: Job ID | Metric A | Metric B ...)
-                    summary_row = {"job_id": job_id}
-                    # Ensure values are floats
-                    for m_name, m_val in single_job_metrics.items():
-                        if m_val is not None:
-                            summary_row[m_name] = float(m_val)
-
-                    if len(summary_row) > 1:  # Contains more than just job_id
-                        summary_df = pd.DataFrame([summary_row])
+                    summary_df = build_single_job_summary_df(
+                        job_id, single_job_metrics, metrics_definition
+                    )
+                    if not summary_df.empty:
                         # Append to HDF5
-                        # Note: First append defines the schema. Since metrics_definition is constant, this is safe.
                         store.append(
                             "summary",
                             summary_df,
@@ -859,19 +856,19 @@ def run_post_processing(
     This function iterates through the post-processing tasks defined in the
     configuration. For each task, it dynamically loads the specified module
     (from a module name or a script path) and executes the target function,
-    passing the results DataFrame and other parameters to it.
+    passing the HDF5 results path and other parameters to it.
 
     Args:
         config: The main configuration dictionary.
-        results_df: The combined DataFrame of simulation results.
+        results_df: Deprecated legacy argument retained for call compatibility.
         post_processing_output_dir: The directory to save any output from the tasks.
-        results_file_path: Path to the HDF5 results file (optional).
+        results_file_path: Path to the HDF5 results file.
 
     Note:
         Supports two loading methods: 'script_path' for direct .py files, or 'module'
-        for installed packages. Creates output_dir if it doesn't exist. Passes results_df,
-        output_dir, and user-specified params to each task function. Logs errors for
-        failed tasks but continues with remaining tasks.
+        for installed packages. Creates output_dir if it doesn't exist. Passes
+        results_file_path, output_dir, and user-specified params to each task function.
+        Logs errors for failed tasks but continues with remaining tasks.
     """
     post_processing_configs = config.get("post_processing")
     if not post_processing_configs:
@@ -886,6 +883,10 @@ def run_post_processing(
         "Post-processing report will be saved",
         extra={"output_dir": post_processing_dir},
     )
+
+    if not results_file_path:
+        logger.error("Post-processing requires a valid HDF5 results file path.")
+        return
 
     for i, task_config in enumerate(post_processing_configs):
         try:
@@ -929,26 +930,8 @@ def run_post_processing(
                     )
                     continue
 
-            # Old method: Load from module name (backward compatibility)
             elif "module" in task_config:
                 module_name = task_config["module"]
-
-                # Auto-redirect to HDF5 version if applicable
-                if (
-                    results_file_path
-                    and "tricys.postprocess" in module_name
-                    and "hdf5" not in module_name
-                ):
-                    base_name = module_name.split(".")[-1]
-                    potential_hdf5_module = f"tricys.postprocess.hdf5.{base_name}"
-                    try:
-                        importlib.util.find_spec(potential_hdf5_module)
-                        module_name = potential_hdf5_module
-                        logger.info(
-                            f"Redirecting to HDF5 post-processing module: {module_name}"
-                        )
-                    except ImportError:
-                        pass  # Fallback to original
 
                 logger.info(
                     "Running post-processing task from module",
@@ -969,18 +952,11 @@ def run_post_processing(
 
             if module:
                 post_processing_func = getattr(module, function_name)
-                if results_file_path:
-                    # Pass HDF5 path instead of DataFrame
-                    post_processing_func(
-                        results_file_path=results_file_path,
-                        output_dir=post_processing_dir,
-                        **params,
-                    )
-                else:
-                    # Pass DataFrame (Legacy)
-                    post_processing_func(
-                        results_df=results_df, output_dir=post_processing_dir, **params
-                    )
+                post_processing_func(
+                    results_file_path=results_file_path,
+                    output_dir=post_processing_dir,
+                    **params,
+                )
             else:
                 logger.error(
                     "Failed to load post-processing module.",

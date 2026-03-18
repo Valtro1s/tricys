@@ -3,6 +3,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
+from tricys.analysis.hdf5_support import iter_hdf5_job_results
+from tricys.utils.hdf5_schema import load_jobs_df
+
 
 def get_final_value(
     series: pd.Series, time_series: Optional[pd.Series] = None
@@ -329,3 +332,68 @@ def calculate_single_job_metrics(
                 pass
 
     return results
+
+
+def build_single_job_summary_df(
+    job_id: int,
+    single_job_metrics: Dict[str, float],
+    metrics_definition: Dict[str, Any],
+) -> pd.DataFrame:
+    """Build a stable-schema one-row summary DataFrame for HDF5 appends."""
+    summary_row = {"job_id": int(job_id)}
+    has_metric_value = False
+
+    for metric_name, definition in metrics_definition.items():
+        if definition.get("method") == "bisection_search":
+            continue
+
+        metric_value = single_job_metrics.get(metric_name)
+        if metric_value is None:
+            summary_row[metric_name] = float("nan")
+            continue
+
+        summary_row[metric_name] = float(metric_value)
+        has_metric_value = True
+
+    if not has_metric_value:
+        return pd.DataFrame()
+
+    return pd.DataFrame([summary_row])
+
+
+def extract_metrics_from_hdf5(
+    hdf_path: str,
+    metrics_definition: Dict[str, Any],
+    analysis_case: Dict[str, Any],
+) -> pd.DataFrame:
+    """Extracts summary metrics directly from unified HDF5 results without rebuilding a wide dataframe."""
+    jobs_df = load_jobs_df(hdf_path)
+    if jobs_df.empty:
+        return pd.DataFrame()
+
+    required_columns = []
+    for metric_name in analysis_case.get("dependent_variables", []):
+        definition = metrics_definition.get(metric_name)
+        if not definition or definition.get("method") == "bisection_search":
+            continue
+        source_col = definition.get("source_column")
+        if source_col:
+            required_columns.append(source_col)
+
+    required_columns = list(dict.fromkeys(required_columns))
+    rows = []
+
+    for _, job_params, job_df in iter_hdf5_job_results(
+        hdf_path, jobs_df=jobs_df, columns=required_columns
+    ):
+        metric_values = calculate_single_job_metrics(job_df, metrics_definition)
+        if not metric_values:
+            continue
+        row = job_params.copy()
+        row.update(metric_values)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
