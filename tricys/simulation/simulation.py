@@ -38,6 +38,7 @@ from tricys.core.modelica import (
 from tricys.utils.concurrency_utils import get_safe_max_workers
 from tricys.utils.config_utils import basic_prepare_config
 from tricys.utils.file_utils import get_unique_filename
+from tricys.utils.filter_schema import find_filter_schema_violations
 from tricys.utils.log_utils import setup_logging
 
 # Standard logger setup
@@ -477,7 +478,7 @@ def run_sequential_sweep(
     config: dict,
     jobs: List[Dict[str, Any]],
     post_job_callback: Callable[[int, Dict[str, Any], str], None] = None,
-    filter_data: bool = False,
+    filter_schema: List[Dict[str, Any]] | None = None,
 ) -> List[str]:
     """Executes a parameter sweep sequentially.
 
@@ -594,14 +595,16 @@ def run_sequential_sweep(
 
                 # Pre-filter check before metric calc
                 skip_metrics = False
-                if filter_data and os.path.exists(result_file_path):
+                if filter_schema and os.path.exists(result_file_path):
                     try:
                         temp_df = pd.read_csv(result_file_path)
-                        num_cols = temp_df.select_dtypes(include=["number"]).columns
-                        if (temp_df[num_cols] < 0).any().any():
+                        violations = find_filter_schema_violations(
+                            temp_df, filter_schema
+                        )
+                        if violations:
                             skip_metrics = True
                             logger.info(
-                                f"Job {i+1} has negative values. Skipping metric calculations due to filter."
+                                f"Job {i+1} matched filter_schema. Skipping metric calculations before HDF5 append."
                             )
                     except Exception:
                         pass
@@ -667,7 +670,7 @@ def _process_h5_result(
     params: dict,
     res_path: str,
     metrics_definition: dict = None,
-    filter_data: bool = False,
+    filter_schema: List[Dict[str, Any]] | None = None,
 ):
     """Helper to process simulation result into HDF5 store."""
     if not res_path or not os.path.exists(res_path):
@@ -676,11 +679,17 @@ def _process_h5_result(
     try:
         df = pd.read_csv(res_path)
 
-        if filter_data:
-            numeric_cols = df.select_dtypes(include=["number"]).columns
-            if (df[numeric_cols] < 0).any().any():
+        if filter_schema:
+            violations = find_filter_schema_violations(df, filter_schema)
+            if violations:
+                violation_messages = ", ".join(
+                    [
+                        f"{item['column']} {item['kind']} {item['threshold']} (observed={item['observed']})"
+                        for item in violations
+                    ]
+                )
                 logger.warning(
-                    f"Negative values detected in result for job {job_id}. Skipping append to HDF5."
+                    f"Result for job {job_id} filtered out by filter_schema. Violations: {violation_messages}"
                 )
                 # Cleanup immediately to save disk space
                 job_dir = os.path.dirname(res_path)
@@ -1148,9 +1157,7 @@ def _mp_run_co_simulation_job_wrapper(args):
         return job_id, job_params, None, str(e)
 
 
-def run_simulation(
-    config: Dict[str, Any], export_csv: bool = False, filter_data: bool = False
-) -> None:
+def run_simulation(config: Dict[str, Any], export_csv: bool = False) -> None:
     """Orchestrates the main simulation workflow.
 
     Simplified Mode Logic (Unified HDF5 Storage):
@@ -1188,6 +1195,7 @@ def run_simulation(
     )
     is_co_sim = config.get("co_simulation") is not None
     metrics_definition = config.get("metrics_definition", {})
+    filter_schema = config.get("filter_schema")
 
     # HDF5 Setup (Unified)
     hdf_filename = "sweep_results.h5"
@@ -1252,7 +1260,7 @@ def run_simulation(
                                 job_p,
                                 result_path,
                                 metrics_definition,
-                                filter_data=filter_data,
+                                filter_schema=filter_schema,
                             )
 
                 try:
@@ -1265,41 +1273,55 @@ def run_simulation(
 
         # --- Sequential Mode ---
         else:
-            if is_co_sim:
-                for i, job_params in enumerate(jobs):
-                    job_id = i + 1
-                    logger.info(f"Running job {job_id}/{len(jobs)}")
-                    try:
-                        result_path = run_co_simulation_job(
-                            config, job_params, job_id=job_id
-                        )
+            from tricys.utils.log_capture import LogCapture
+
+            with LogCapture() as log_handler:
+                if is_co_sim:
+                    for i, job_params in enumerate(jobs):
+                        job_id = i + 1
+                        logger.info(f"Running job {job_id}/{len(jobs)}")
+                        try:
+                            result_path = run_co_simulation_job(
+                                config, job_params, job_id=job_id
+                            )
+                            _process_h5_result(
+                                store,
+                                job_id,
+                                job_params,
+                                result_path,
+                                metrics_definition,
+                                filter_schema=filter_schema,
+                            )
+                        except Exception as e:
+                            logger.error(f"Job {job_id} failed: {e}")
+                else:
+                    # Standard Sequential using callback to stream to HDF5
+                    logger.info("Running sequential sweep with HDF5 streaming.")
+
+                    def h5_callback(idx, params, res_path):
                         _process_h5_result(
                             store,
-                            job_id,
-                            job_params,
-                            result_path,
+                            idx + 1,
+                            params,
+                            res_path,
                             metrics_definition,
-                            filter_data=filter_data,
+                            filter_schema=filter_schema,
                         )
-                    except Exception as e:
-                        logger.error(f"Job {job_id} failed: {e}")
-            else:
-                # Standard Sequential using callback to stream to HDF5
-                logger.info("Running sequential sweep with HDF5 streaming.")
 
-                def h5_callback(idx, params, res_path):
-                    _process_h5_result(
-                        store,
-                        idx + 1,
-                        params,
-                        res_path,
-                        metrics_definition,
-                        filter_data=filter_data,
+                    run_sequential_sweep(
+                        config,
+                        jobs,
+                        post_job_callback=h5_callback,
+                        filter_schema=filter_schema,
                     )
 
-                run_sequential_sweep(
-                    config, jobs, post_job_callback=h5_callback, filter_data=filter_data
-                )
+                try:
+                    logs_json = log_handler.to_json()
+                    log_df = pd.DataFrame({"log": [logs_json]})
+                    log_df = log_df.astype(object)
+                    store.put("log", log_df, format="fixed")
+                except Exception as e:
+                    logger.warning(f"Failed to save logs to HDF5: {e}")
 
     # Export CSV if requested
     if export_csv:
@@ -1326,7 +1348,6 @@ def main(
     config_or_path: Union[str, Dict[str, Any]],
     base_dir: str = None,
     export_csv: bool = False,
-    filter_data: bool = False,
 ) -> None:
     """Main entry point for the simulation runner.
 
@@ -1351,7 +1372,7 @@ def main(
         },
     )
     try:
-        run_simulation(config, export_csv=export_csv, filter_data=filter_data)
+        run_simulation(config, export_csv=export_csv)
         logger.info("Main execution completed successfully")
     except Exception as e:
         logger.error(
@@ -1371,10 +1392,5 @@ if __name__ == "__main__":
         required=True,
         help="Path to the JSON configuration file.",
     )
-    parser.add_argument(
-        "--filter",
-        action="store_true",
-        help="Filter out results containing negative values.",
-    )
     args = parser.parse_args()
-    main(args.config, filter_data=args.filter)
+    main(args.config)
