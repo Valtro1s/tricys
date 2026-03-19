@@ -101,6 +101,25 @@ image: ghcr.io/asipp-neutronics/tricys_openmodelica_gui:docker_dev
     make dev-install
     ```
 
+## Project Ecosystem & Submodules
+
+The TRICYS platform is composed of several specialized modules designed to work together to provide a seamless simulation and visualization experience:
+
+- **`tricys` (Core)**: The core Python engine handling physics modeling, Modelica integration, parameter scanning, and AI-enhanced report generation.
+- **`tricys_backend`**: A high-performance FastAPI service that manages simulation task queues, WebSocket log streaming, and HDF5 data retrieval.
+- **`tricys_visual`**: The modern Vue 3 frontend for real-time 3D visualization, system configuration, and monitoring.
+- **`tricys_goview`**: A specialized low-code data dashboard built on the Vue 3 GoView framework for advanced analytical visualizations.
+
+## One-Click Start (Full System)
+
+For users who want to run the complete platform (Backend + Frontend + Visualizer) simultaneously, we provide a convenient startup script for Windows:
+
+```bash
+# Start backend, visual frontend, and goview dashboard all at once
+start_all.bat
+```
+
+This script will automatically open three separate CMD windows, start the FastAPI backend server on port 8000, and launch the Vue development servers for both `tricys_visual` and `tricys_goview`. (Ensure you have installed the respective dependencies for all submodules before running).
 
 ## Documentation
 
