@@ -4,6 +4,8 @@ from functools import lru_cache
 
 import pandas as pd
 
+from tricys.utils.hdf5_schema import load_jobs_df, load_summary_df
+
 
 def load_h5_data(file_path):
     """
@@ -14,11 +16,9 @@ def load_h5_data(file_path):
         if not os.path.exists(file_path):
             return [], [], [], [], None, None
 
-        # Load Jobs Metadata
         try:
-            jobs_df = pd.read_hdf(file_path, "jobs")
+            jobs_df = load_jobs_df(file_path)
         except KeyError:
-            # Handle case where 'jobs' key might be missing or different
             return [], [], [], [], None, None
 
         c_data = None
@@ -120,7 +120,7 @@ def _load_summary_data_cached(h5_path, job_ids_key):
             if "/summary" not in store.keys():
                 return []
 
-            df = pd.read_hdf(h5_path, "summary", where=where_clause)
+            df = load_summary_df(h5_path, where=where_clause)
             return df.to_dict("records")
 
     except Exception as e:

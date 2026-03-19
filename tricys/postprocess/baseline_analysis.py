@@ -16,6 +16,7 @@ import pandas as pd
 import seaborn as sns
 
 from tricys.utils.config_utils import get_llm_env
+from tricys.utils.hdf5_schema import RESULTS_KEY, load_jobs_df
 
 logger = logging.getLogger(__name__)
 
@@ -874,117 +875,595 @@ def generate_academic_report(output_dir: str, ai_model: str, **kwargs) -> None:
         )
 
 
-def baseline_analysis(results_df: pd.DataFrame, output_dir: str, **kwargs) -> None:
-    """Generates baseline analysis plots and reports.
+def _build_series_label(variable_name: str, job_params: dict) -> str:
+    filtered_params = {k: v for k, v in sorted(job_params.items()) if pd.notna(v)}
+    param_string = "&".join([f"{k}={v}" for k, v in filtered_params.items()])
+    return f"{variable_name}&{param_string}" if param_string else variable_name
 
-    Creates three outputs:
-    1. A time-series plot with overall view and detailed zoom around turning point
-    2. A bar chart showing final values of all variables, sorted
-    3. An optional Markdown report with AI analysis (if 'ai' flag is True)
 
-    Args:
-        results_df: The combined DataFrame of simulation results.
-        output_dir: The directory to save the plots and report.
-        **kwargs: Additional parameters from config, including 'ai' flag, 'detailed_var',
-            'glossary_path', and AI model settings.
+def _build_sample_dataframe(
+    time_values, sample_columns: dict[str, list[float]]
+) -> pd.DataFrame:
+    sample_df = pd.DataFrame({"time": pd.Series(time_values)})
+    for label, values in sample_columns.items():
+        sample_df[label] = pd.Series(values)
+    return sample_df
 
-    Note:
-        Removes duplicate rows before processing. Creates bilingual plots (English and
-        Chinese). If AI analysis enabled, requires API_KEY, BASE_URL, and AI_MODELS/AI_MODEL
-        environment variables. Generates both initial LLM analysis and academic summary.
-    """
-    if "time" not in results_df.columns:
-        logger.error("Plotting failed: 'time' column not found in results DataFrame.")
-        return
 
-    if "glossary_path" in kwargs:
-        load_glossary(kwargs["glossary_path"])
+def _collect_baseline_stream_data(results_file_path: str, **kwargs) -> dict:
+    detailed_var = kwargs.get("detailed_var", "sds.I[1]")
+    num_points = 20
+    interval = 2
+    window_size = (num_points - 1) * interval + 1
 
-    os.removedirs(output_dir) if os.path.exists(output_dir) else None
-    p = Path(output_dir)
-    output_dir = p.parent / "report"
-    os.makedirs(output_dir, exist_ok=True)
+    jobs_df = load_jobs_df(results_file_path)
+    metrics_data = []
+    final_values = {}
+    start_sample_columns = {}
+    end_sample_columns = {}
+    turning_sample_columns = {}
+    start_time_values = []
+    end_time_values = []
+    turning_time_values = []
+    result_columns = []
+    turning_value_min = float("inf")
+    turning_index = None
+    turning_label = None
 
-    df = results_df.copy()
-    # Remove duplicate rows before processing
-    df.drop_duplicates(inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    with pd.HDFStore(results_file_path, mode="r") as store:
+        sample_df = store.select(RESULTS_KEY, start=0, stop=1)
+        if sample_df.empty:
+            return {}
 
-    # Create a unified color map for all variables
-    all_plot_columns = sorted([col for col in df.columns if col != "time"])
-    colors = sns.color_palette("turbo", len(all_plot_columns))
-    color_map = dict(zip(all_plot_columns, colors))
+        result_columns = [
+            col for col in sample_df.columns if col not in ["time", "job_id"]
+        ]
 
-    # Add the color map to kwargs to pass it to the helper functions
-    plot_kwargs = kwargs.copy()
-    plot_kwargs["color_map"] = color_map
+        for _, job_row in jobs_df.iterrows():
+            job_id = int(job_row["job_id"])
+            job_params = job_row.drop(labels=["job_id"]).to_dict()
+            job_df = store.select(RESULTS_KEY, where=f"job_id == {job_id}")
 
-    # Generate the time-series plot with zoom
-    _plot_time_series_with_zoom(df, output_dir, **plot_kwargs)
+            if job_df.empty:
+                continue
 
-    # Generate the bar chart of final values
-    _plot_final_values_bar_chart(df, output_dir, **plot_kwargs)
+            job_df = job_df.reset_index(drop=True)
+            time_series = job_df["time"].reset_index(drop=True)
 
-    # --- Report Generation and AI Analysis ---
-    base_report_path, base_report_content = _generate_postprocess_report(
-        df, output_dir, **kwargs
+            start_indices = list(range(0, min(len(job_df), window_size), interval))
+            end_start = max(0, len(job_df) - window_size)
+            end_indices = list(range(end_start, len(job_df), interval))
+
+            if not start_time_values:
+                start_time_values = time_series.iloc[start_indices].tolist()
+            if not end_time_values:
+                end_time_values = time_series.iloc[end_indices].tolist()
+
+            for variable_name in result_columns:
+                if variable_name not in job_df.columns:
+                    continue
+
+                label = _build_series_label(variable_name, job_params)
+                series = job_df[variable_name].reset_index(drop=True)
+
+                if series.empty:
+                    continue
+
+                final_values[label] = float(series.iloc[-1])
+                start_sample_columns[label] = series.iloc[start_indices].tolist()
+                end_sample_columns[label] = series.iloc[end_indices].tolist()
+
+                if label.startswith(detailed_var):
+                    startup_inventory = _calculate_startup_inventory(
+                        series, time_series
+                    )
+                    turning_point_time = _time_of_turning_point(series, time_series)
+                    doubling_time = _calculate_doubling_time(series, time_series)
+
+                    metrics_data.append(
+                        {
+                            "变量 (Variable)": label,
+                            "启动库存 (Startup Inventory)": f"{startup_inventory:.4f}",
+                            "自持时间 (Self-Sufficiency Time)": (
+                                f"{turning_point_time/24:.2f} 天"
+                                if pd.notna(turning_point_time)
+                                else "N/A"
+                            ),
+                            "倍增时间 (Doubling Time)": (
+                                f"{doubling_time/24:.2f} 天"
+                                if pd.notna(doubling_time)
+                                else "N/A"
+                            ),
+                        }
+                    )
+
+                    current_min = series.min()
+                    if current_min < turning_value_min:
+                        turning_value_min = current_min
+                        turning_index = int(series.idxmin())
+                        turning_label = label
+
+        if turning_index is not None:
+            for _, job_row in jobs_df.iterrows():
+                job_id = int(job_row["job_id"])
+                job_params = job_row.drop(labels=["job_id"]).to_dict()
+                job_df = store.select(RESULTS_KEY, where=f"job_id == {job_id}")
+
+                if job_df.empty:
+                    continue
+
+                job_df = job_df.reset_index(drop=True)
+                time_series = job_df["time"].reset_index(drop=True)
+                window_radius_indices = (num_points // 2) * interval
+                start_idx = max(0, turning_index - window_radius_indices)
+                end_idx = min(len(job_df), turning_index + window_radius_indices)
+                turning_indices = list(range(start_idx, end_idx, interval))
+
+                if not turning_time_values:
+                    turning_time_values = time_series.iloc[turning_indices].tolist()
+
+                for variable_name in result_columns:
+                    if variable_name not in job_df.columns:
+                        continue
+
+                    label = _build_series_label(variable_name, job_params)
+                    series = job_df[variable_name].reset_index(drop=True)
+                    turning_sample_columns[label] = series.iloc[
+                        turning_indices
+                    ].tolist()
+
+    if not final_values:
+        return {}
+
+    sorted_final_values = pd.Series(final_values).sort_values(ascending=False)
+    color_map = dict(
+        zip(
+            sorted(sorted_final_values.index),
+            sns.color_palette("turbo", len(sorted_final_values)),
+        )
     )
 
-    if base_report_path and kwargs.get("ai", False):
-        env = get_llm_env({"llm_env": kwargs.get("llm_env")})
-        api_key = env.get("API_KEY")
-        base_url = env.get("BASE_URL")
+    return {
+        "jobs_df": jobs_df,
+        "result_columns": result_columns,
+        "metrics_df": pd.DataFrame(metrics_data),
+        "final_values": sorted_final_values,
+        "start_sample_df": _build_sample_dataframe(
+            start_time_values, start_sample_columns
+        ),
+        "end_sample_df": _build_sample_dataframe(end_time_values, end_sample_columns),
+        "turning_sample_df": _build_sample_dataframe(
+            turning_time_values, turning_sample_columns
+        ),
+        "color_map": color_map,
+        "turning_label": turning_label,
+    }
 
-        # Prioritize AI_MODELS, fallback to AI_MODEL
-        ai_models_str = env.get("AI_MODELS") or env.get("AI_MODEL")
 
-        if not api_key or not base_url or not ai_models_str:
-            logger.warning(
-                "API_KEY, BASE_URL, or AI_MODELS/AI_MODEL not found in environment variables. Skipping LLM analysis."
+def _plot_time_series_with_zoom_from_hdf5(
+    results_file_path: str,
+    jobs_df: pd.DataFrame,
+    result_columns: list[str],
+    output_dir: str,
+    **kwargs,
+) -> None:
+    detailed_var = kwargs.get("detailed_var", "sds.I[1]")
+    color_map = kwargs.get("color_map", {})
+    turning_label = kwargs.get("turning_label")
+
+    min_x_global = float("inf")
+    with pd.HDFStore(results_file_path, mode="r") as store:
+        for _, job_row in jobs_df.iterrows():
+            job_id = int(job_row["job_id"])
+            job_params = job_row.drop(labels=["job_id"]).to_dict()
+            job_df = store.select(RESULTS_KEY, where=f"job_id == {job_id}")
+
+            if job_df.empty:
+                continue
+
+            job_df = job_df.reset_index(drop=True)
+            time_days = job_df["time"] / 24
+
+            for variable_name in result_columns:
+                if variable_name not in job_df.columns:
+                    continue
+
+                label = _build_series_label(variable_name, job_params)
+                if label.startswith(detailed_var) and label == turning_label:
+                    series = job_df[variable_name]
+                    if not series.empty:
+                        min_idx = series.idxmin()
+                        min_x_global = min(min_x_global, float(time_days.loc[min_idx]))
+
+    sns.set_theme(style="whitegrid")
+    original_lang_is_chinese = _use_chinese_labels
+
+    for lang in ["en", "cn"]:
+        set_plot_language(lang)
+
+        y_label = kwargs.get("y_label", _get_text("y_label"))
+        fig, (ax1, ax2) = plt.subplots(
+            2,
+            1,
+            figsize=kwargs.get("figsize", (14, 18)),
+            sharex=False,
+            gridspec_kw={"height_ratios": [2, 1]},
+        )
+
+        y_min_in_range = float("inf")
+        y_max_in_range = float("-inf")
+        total_series = 0
+
+        with pd.HDFStore(results_file_path, mode="r") as store:
+            for _, job_row in jobs_df.iterrows():
+                job_id = int(job_row["job_id"])
+                job_params = job_row.drop(labels=["job_id"]).to_dict()
+                job_df = store.select(RESULTS_KEY, where=f"job_id == {job_id}")
+
+                if job_df.empty:
+                    continue
+
+                job_df = job_df.reset_index(drop=True)
+                time_days = job_df["time"] / 24
+
+                for variable_name in result_columns:
+                    if variable_name not in job_df.columns:
+                        continue
+
+                    label = _build_series_label(variable_name, job_params)
+                    series = job_df[variable_name]
+                    color = color_map.get(label, "blue")
+                    formatted_label = _format_label(label)
+
+                    ax1.plot(
+                        time_days,
+                        series,
+                        label=formatted_label,
+                        color=color,
+                        linewidth=1.2,
+                        alpha=0.85,
+                    )
+                    ax2.plot(
+                        time_days,
+                        series,
+                        label=formatted_label,
+                        color=color,
+                        linewidth=1.5,
+                        alpha=0.9,
+                    )
+                    total_series += 1
+
+                    if np.isfinite(min_x_global):
+                        mask = (time_days >= 0) & (time_days <= min_x_global + 5)
+                        if mask.any():
+                            in_range_values = series.loc[mask]
+                            if not in_range_values.empty:
+                                y_min_in_range = min(
+                                    y_min_in_range, float(in_range_values.min())
+                                )
+                                y_max_in_range = max(
+                                    y_max_in_range, float(in_range_values.max())
+                                )
+
+        ax1.set_ylabel(_format_label(y_label), fontsize=14)
+        ax1.set_title(_get_text("overall_view_title"), fontsize=12)
+        if total_series <= 20:
+            ax1.legend(loc="best", fontsize="x-small")
+        ax1.grid(True)
+        ax1.set_xlabel(_get_text("time_days"), fontsize=14)
+
+        ax2.set_ylabel(_format_label(y_label), fontsize=14)
+        detailed_view_title = _get_text("detailed_view_zoom_title").format(
+            detailed_var=_format_label(detailed_var)
+        )
+        ax2.set_title(detailed_view_title, fontsize=12)
+        ax2.grid(True, linestyle="--")
+        ax2.set_xlabel(_get_text("time_days"), fontsize=14)
+        if total_series <= 20:
+            ax2.legend(loc="best", fontsize="x-small")
+
+        if (
+            np.isfinite(min_x_global)
+            and np.isfinite(y_min_in_range)
+            and np.isfinite(y_max_in_range)
+        ):
+            x1_zoom, x2_zoom = 0, min_x_global + 5
+            ax2.set_xlim(x1_zoom, x2_zoom)
+            y_padding = (y_max_in_range - y_min_in_range) * 0.1
+            ax2.set_ylim(y_min_in_range - y_padding, y_max_in_range + y_padding)
+            y1_ax1, y2_ax1 = ax1.get_ylim()
+            ax1.add_patch(
+                patches.Rectangle(
+                    (x1_zoom, y1_ax1),
+                    x2_zoom - x1_zoom,
+                    y2_ax1 - y1_ax1,
+                    linewidth=1,
+                    edgecolor="r",
+                    facecolor="red",
+                    linestyle="--",
+                    alpha=0.1,
+                )
             )
+        else:
+            logger.warning(
+                f"Could not determine a zoom range for the detailed view. The primary variable for zooming '{detailed_var}' was not found or had no data. The detailed view will be hidden."
+            )
+            ax2.set_visible(False)
+
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        base_filename = kwargs.get(
+            "output_filename", "simulation_all_curves_detailed.svg"
+        )
+        name, ext = os.path.splitext(base_filename)
+        suffix = "_zh" if lang == "cn" else ""
+        output_filename = f"{name}{suffix}{ext}"
+        save_path = os.path.join(output_dir, output_filename)
+
+        try:
+            plt.rcParams["svg.fonttype"] = "path"
+            plt.savefig(save_path, format="svg", bbox_inches="tight")
+            logger.info(f"Successfully generated plot with all curves: {save_path}")
+        finally:
+            plt.close(fig)
+
+    set_plot_language("cn" if original_lang_is_chinese else "en")
+
+
+def _plot_final_values_bar_chart_from_series(
+    final_values: pd.Series, output_dir: str, **kwargs
+) -> None:
+    color_map = kwargs.get("color_map", {})
+    bar_colors = [color_map.get(col, "blue") for col in final_values.index]
+
+    original_lang_is_chinese = _use_chinese_labels
+    for lang in ["en", "cn"]:
+        plt.style.use("seaborn-v0_8-whitegrid")
+        set_plot_language(lang)
+
+        fig, ax = plt.subplots(figsize=kwargs.get("bar_chart_figsize", (12, 8)))
+        x_labels = [_format_label(col) for col in final_values.index]
+        sns.barplot(x=x_labels, y=final_values.values, ax=ax, palette=bar_colors)
+
+        title = kwargs.get("bar_chart_title", _get_text("final_values_bar_chart_title"))
+        ax.set_title(_format_label(title), fontsize=16, fontweight="bold")
+        y_label = kwargs.get("y_label", _get_text("final_value"))
+        ax.set_ylabel(_format_label(y_label), fontsize=12)
+        ax.set_xlabel("", fontsize=12)
+        plt.xticks(rotation=45, ha="right", fontsize=10)
+
+        for patch in ax.patches:
+            ax.annotate(
+                f"{patch.get_height():.2e}",
+                (patch.get_x() + patch.get_width() / 2.0, patch.get_height()),
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="black",
+                xytext=(0, 5),
+                textcoords="offset points",
+            )
+
+        fig.tight_layout()
+        base_filename = kwargs.get("bar_chart_filename", "final_values_bar_chart.svg")
+        name, ext = os.path.splitext(base_filename)
+        suffix = "_zh" if lang == "cn" else ""
+        output_filename = f"{name}{suffix}{ext}"
+        save_path = os.path.join(output_dir, output_filename)
+
+        try:
+            plt.rcParams["svg.fonttype"] = "path"
+            plt.savefig(save_path, format="svg", bbox_inches="tight")
+            logger.info(
+                f"Successfully generated bar chart of final values: {save_path}"
+            )
+        finally:
+            plt.close(fig)
+
+    set_plot_language("cn" if original_lang_is_chinese else "en")
+
+
+def _generate_postprocess_report_from_stream_data(
+    stream_data: dict, output_dir: str, **kwargs
+) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        logger.info("Starting to generate post-process report.")
+        ts_filename_base = kwargs.get(
+            "output_filename", "simulation_all_curves_detailed.svg"
+        )
+        ts_name, ts_ext = os.path.splitext(ts_filename_base)
+        time_series_plot_filename = f"{ts_name}_zh{ts_ext}"
+
+        bar_filename_base = kwargs.get(
+            "bar_chart_filename", "final_values_bar_chart.svg"
+        )
+        bar_name, bar_ext = os.path.splitext(bar_filename_base)
+        bar_chart_filename = f"{bar_name}_zh{bar_ext}"
+
+        report_filename = kwargs.get(
+            "report_filename", "baseline_condition_analysis_report.md"
+        )
+        report_path = os.path.join(output_dir, report_filename)
+
+        report_lines = [
+            "# 基准工况分析报告\n\n",
+            f"生成时间: {pd.Timestamp.now()}\n\n",
+        ]
+
+        config_to_report = {k: v for k, v in kwargs.items() if k not in ["color_map"]}
+        if config_to_report:
+            report_lines.extend(
+                [
+                    "## 后处理配置详情\n\n",
+                    "本次后处理任务的具体配置如下：\n\n",
+                    "```json\n",
+                    json.dumps(config_to_report, indent=4, ensure_ascii=False),
+                    "\n```\n\n",
+                ]
+            )
+
+        report_lines.append("## 关键性能指标\n\n")
+        metrics_df = stream_data["metrics_df"]
+        detailed_var = kwargs.get("detailed_var", "sds.I[1]")
+        if metrics_df.empty:
+            report_lines.append(
+                f"未找到与主要变量 '{detailed_var}' 相关的列，无法计算关键指标。\n\n"
+            )
+        else:
+            report_lines.append(metrics_df.to_markdown(index=False))
+            report_lines.append("\n\n")
+
+        report_lines.extend(
+            [
+                "## 模拟结果时序图\n\n",
+                "下图展示了所有变量随时间变化的曲线，并对关键转折点进行了放大。\n\n",
+                f"![时序图]({time_series_plot_filename})\n\n",
+                "## 模拟结束时各变量最终值\n\n",
+                "下图通过条形图展示了模拟结束时各个变量的最终值，并按大小排序。\n\n",
+                f"![最终值条形图]({bar_chart_filename})\n\n",
+            ]
+        )
+
+        report_lines.append("## 最终值数据表\n\n")
+        report_lines.append(
+            stream_data["final_values"]
+            .to_frame(name=kwargs.get("y_label", "Final Value"))
+            .to_markdown()
+        )
+        report_lines.append("\n\n")
+        logger.info("Added final values table to report.")
+
+        report_lines.append("## 关键阶段抽样数据\n\n")
+        report_lines.append(
+            "这是从完整时间序列数据中抽样的三个关键阶段的表格，每个阶段包含约 20 个数据点 (采样间隔 2)。\n\n"
+        )
+        report_lines.append("### 1. 初始阶段数据 (前 20 个数据点)\n")
+        report_lines.append(
+            stream_data["start_sample_df"].to_markdown(index=False) + "\n\n"
+        )
+
+        turning_sample_df = stream_data["turning_sample_df"]
+        if not turning_sample_df.empty and len(turning_sample_df.columns) > 1:
+            report_lines.append(
+                f"### 2. 转折点阶段数据 (围绕 '{detailed_var}' 的最小值)\n"
+            )
+            report_lines.append(turning_sample_df.to_markdown(index=False) + "\n\n")
+        else:
+            report_lines.append(
+                f"### 2. 转折点阶段数据\n在提供的抽样中未找到 '{detailed_var}' 的明确转折点。\n\n"
+            )
+
+        report_lines.append("### 3. 结束阶段数据 (后 20 个数据点)\n")
+        report_lines.append(
+            stream_data["end_sample_df"].to_markdown(index=False) + "\n\n"
+        )
+        logger.info("Finished data sampling and added to report lines.")
+
+        report_content = "".join(report_lines)
+        logger.info(f"Final report content length: {len(report_content)}")
+        with open(report_path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(report_content)
+
+        logger.info(f"Post-process analysis report generated: {report_path}")
+        return report_path, report_content
+
+    except Exception as e:
+        logger.error(f"Error generating post-process report: {e}", exc_info=True)
+        return None, None
+
+
+def baseline_analysis(results_file_path: str, output_dir: str, **kwargs) -> None:
+    """Generates baseline analysis plots and reports from a unified HDF5 results file."""
+    if not os.path.exists(results_file_path):
+        logger.error(f"HDF5 file not found: {results_file_path}")
+        return
+
+    try:
+        if "glossary_path" in kwargs:
+            load_glossary(kwargs["glossary_path"])
+
+        report_dir = Path(output_dir).parent / "report"
+        os.makedirs(report_dir, exist_ok=True)
+
+        stream_data = _collect_baseline_stream_data(results_file_path, **kwargs)
+        if not stream_data:
+            logger.warning("No data found to analyze for baseline analysis.")
             return
 
-        ai_models = [model.strip() for model in ai_models_str.split(",")]
+        plot_kwargs = kwargs.copy()
+        plot_kwargs["color_map"] = stream_data["color_map"]
+        plot_kwargs["turning_label"] = stream_data["turning_label"]
 
-        for ai_model in ai_models:
-            logger.info(f"Generating AI analysis for model: {ai_model}")
+        _plot_time_series_with_zoom_from_hdf5(
+            results_file_path,
+            stream_data["jobs_df"],
+            stream_data["result_columns"],
+            str(report_dir),
+            **plot_kwargs,
+        )
+        _plot_final_values_bar_chart_from_series(
+            stream_data["final_values"], str(report_dir), **plot_kwargs
+        )
 
-            sanitized_model_name = "".join(
-                c for c in ai_model if c.isalnum() or c in ("-", "_")
-            ).rstrip()
-
-            model_report_filename = (
-                f"analysis_report_baseline_condition_{sanitized_model_name}.md"
+        base_report_path, base_report_content = (
+            _generate_postprocess_report_from_stream_data(
+                stream_data, str(report_dir), **kwargs
             )
-            model_report_path = os.path.join(output_dir, model_report_filename)
+        )
 
-            with open(model_report_path, "w", encoding="utf-8") as f:
-                f.write(base_report_content)
+        if base_report_path and kwargs.get("ai", False):
+            env = get_llm_env({"llm_env": kwargs.get("llm_env")})
+            api_key = env.get("API_KEY")
+            base_url = env.get("BASE_URL")
+            ai_models_str = env.get("AI_MODELS") or env.get("AI_MODEL")
 
-            llm_analysis = _call_openai_for_postprocess_analysis(
-                api_key=api_key,
-                base_url=base_url,
-                ai_model=ai_model,
-                report_content=base_report_content,
-                **kwargs,
-            )
+            if not api_key or not base_url or not ai_models_str:
+                logger.warning(
+                    "API_KEY, BASE_URL, or AI_MODELS/AI_MODEL not found in environment variables. Skipping LLM analysis."
+                )
+                return
 
-            if llm_analysis:
-                with open(model_report_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n\n---\n\n# AI模型分析提示词 ({ai_model})\n\n")
-                    f.write("```markdown\n")
-                    f.write(llm_analysis)
-                    f.write("\n```\n")
-                logger.info(
-                    f"Appended LLM analysis for model {ai_model} to {model_report_path}"
+            ai_models = [model.strip() for model in ai_models_str.split(",")]
+
+            for ai_model in ai_models:
+                logger.info(f"Generating AI analysis for model: {ai_model}")
+                sanitized_model_name = "".join(
+                    c for c in ai_model if c.isalnum() or c in ("-", "_")
+                ).rstrip()
+                model_report_filename = (
+                    f"analysis_report_baseline_condition_{sanitized_model_name}.md"
+                )
+                model_report_path = os.path.join(report_dir, model_report_filename)
+
+                with open(model_report_path, "w", encoding="utf-8") as file_obj:
+                    file_obj.write(base_report_content)
+
+                llm_analysis = _call_openai_for_postprocess_analysis(
+                    api_key=api_key,
+                    base_url=base_url,
+                    ai_model=ai_model,
+                    report_content=base_report_content,
+                    **kwargs,
                 )
 
-                # --- ADDED: Second AI call for academic summary ---
-                academic_kwargs = kwargs.copy()
-                academic_kwargs["report_filename"] = model_report_filename
-                generate_academic_report(
-                    output_dir, ai_model=ai_model, **academic_kwargs
-                )
+                if llm_analysis:
+                    with open(model_report_path, "a", encoding="utf-8") as file_obj:
+                        file_obj.write(
+                            f"\n\n---\n\n# AI模型分析提示词 ({ai_model})\n\n"
+                        )
+                        file_obj.write("```markdown\n")
+                        file_obj.write(llm_analysis)
+                        file_obj.write("\n```\n")
+                    logger.info(
+                        f"Appended LLM analysis for model {ai_model} to {model_report_path}"
+                    )
+
+                    academic_kwargs = kwargs.copy()
+                    academic_kwargs["report_filename"] = model_report_filename
+                    generate_academic_report(
+                        str(report_dir), ai_model=ai_model, **academic_kwargs
+                    )
+    except Exception as e:
+        logger.error(f"Failed to run HDF5 baseline analysis: {e}", exc_info=True)
 
 
 # {

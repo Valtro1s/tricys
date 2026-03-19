@@ -14,6 +14,9 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from tricys.analysis.hdf5_support import get_hdf5_result_columns, iter_hdf5_job_results
+from tricys.utils.hdf5_schema import load_jobs_df
+
 _use_chinese_labels = False
 
 # Add a dictionary for UI text translations
@@ -995,93 +998,202 @@ def plot_sweep_time_series(
 
     glossary_maps = load_glossary(glossary_path) if glossary_path else ({}, {})
 
-    try:
-        if csv_path.endswith(".h5"):
-            # logic for HDF5
-            try:
-                jobs_df = pd.read_hdf(csv_path, "jobs_metadata")
-            except KeyError:
-                print(f"Error: 'jobs_metadata' not found in {csv_path}")
-                return []
+    if csv_path.endswith(".h5"):
+        try:
+            jobs_df = load_jobs_df(csv_path)
+        except KeyError:
+            print(f"Error: 'jobs' table not found in {csv_path}")
+            return []
 
-            # Filter jobs based on default_params
-            if default_params:
-                for param, value in default_params.items():
-                    if param in jobs_df.columns:
-                        # Ensure type matching for comparison
-                        jobs_df = jobs_df[jobs_df[param].astype(str) == str(value)]
+        if default_params:
+            for param, value in default_params.items():
+                if param in jobs_df.columns:
+                    jobs_df = jobs_df[jobs_df[param].astype(str) == str(value)]
 
-            job_ids = jobs_df["job_id"].tolist()
-            if not job_ids:
-                print(f"Warning: No jobs found matching parameters {default_params}")
-                return []
+        if jobs_df.empty:
+            print(f"Warning: No jobs found matching parameters {default_params}")
+            return []
 
-            # Read results for these jobs
-            # Construct a where clause. Note: 'in' operator might be limited in num of arguments for PyTables
-            # If too many jobs, we might need chunked reading. For plotting (usually < 100 curves), this is fine.
-            # But sweep can be large.
-            # However, plot_sweep_time_series usually plots a subset (baseline) if default_params is passed.
-            # If default_params is NOT passed, it plots EVERYTHING. That could be huge.
-            # But the original CSV code just reads the whole CSV. If CSV works, HDF5 read should usually work unless it's truly massive.
-            # We'll trust the user isn't plotting 10,000 curves without filtering.
+        raw_plot_alias = (
+            independent_var_alias if independent_var_alias else independent_var_name
+        )
+        y_var_names = [y_var_name] if isinstance(y_var_name, str) else y_var_name
+        result_columns = get_hdf5_result_columns(csv_path)
 
-            try:
-                # Read only necessary columns: time + y_vars + job_id
-                # We can't easily know exactly which columns correspond to y_var_name if it is a regex or partial match.
-                # So we might need to read a sample or just read all columns (but only for specific rows).
-                # Let's read all cols for filtered jobs.
-                # Optimization: Only read rows where job_id is in list.
-                df_raw = pd.read_hdf(csv_path, "results", where=f"job_id in {job_ids}")
-            except Exception as e:
-                print(f"Error reading HDF5 results: {e}")
-                return []
+        y_var_columns = []
+        for y_var in y_var_names:
+            y_var_columns.extend([col for col in result_columns if y_var in col])
+        y_var_columns = list(dict.fromkeys(y_var_columns))
 
-            if df_raw.empty:
-                return []
+        if not y_var_columns:
+            print(
+                f"Warning: No columns found containing any of {y_var_names} in {csv_path} that match the criteria."
+            )
+            return []
 
-            # Reconstruct wide format
-            # New columns: {col_name}&{param_str}
-            data_dfs = []
+        plot_entries = []
+        min_y_global = float("inf")
+        min_x_global = float("inf")
 
-            # Group by job_id to process each job
-            unique_job_ids = df_raw["job_id"].unique()
-
-            for jid in unique_job_ids:
-                job_data = df_raw[df_raw["job_id"] == jid].copy()
-                # Get params for this job
-                # jobs_df index might not be job_id. filtering jobs_df again
-                job_row = jobs_df[jobs_df["job_id"] == jid].iloc[0]
-                job_params = job_row.drop("job_id").to_dict()
-
-                param_string = "&".join([f"{k}={v}" for k, v in job_params.items()])
-
-                # drop job_id
-                job_data = job_data.drop(columns=["job_id"])
-
-                # Store time separately or verify alignment.
-                # Simplest is to set index to time, rename cols, then join.
-                if "time" not in job_data.columns:
+        for _, job_params, job_df in iter_hdf5_job_results(
+            csv_path, jobs_df=jobs_df, columns=y_var_columns
+        ):
+            time_days = job_df["time"] / 24
+            for variable_name in y_var_columns:
+                if variable_name not in job_df.columns:
                     continue
 
-                job_data.set_index("time", inplace=True)
+                y_data = job_df[variable_name] / 1000.0
+                if y_data.empty:
+                    continue
 
-                rename_map = {
-                    c: f"{c}&{param_string}" if param_string else c
-                    for c in job_data.columns
-                }
-                job_data.rename(columns=rename_map, inplace=True)
-                data_dfs.append(job_data)
+                independent_value = job_params.get(independent_var_name)
+                if independent_value is None:
+                    plot_label = variable_name
+                elif len(y_var_columns) == 1:
+                    plot_label = str(independent_value)
+                else:
+                    plot_label = f"{variable_name}={independent_value}"
 
-            if not data_dfs:
-                return []
+                threshold = 2 * y_data.iloc[0]
+                plot_entries.append(
+                    {
+                        "label": plot_label,
+                        "time_days": time_days,
+                        "y_data": y_data,
+                        "y_masked": y_data.where(y_data <= threshold),
+                    }
+                )
 
-            # Combine all (outer join on time index)
-            df = pd.concat(data_dfs, axis=1)
-            df.reset_index(inplace=True)  # Put time back as column
+                min_idx = y_data.idxmin()
+                current_min_y = y_data.loc[min_idx]
+                if current_min_y < min_y_global:
+                    min_y_global = current_min_y
+                    min_x_global = time_days.loc[min_idx]
 
-        else:
-            # Legacy CSV
-            df = pd.read_csv(csv_path)
+        if not plot_entries:
+            return []
+
+        print(
+            f"Found {len(plot_entries)} HDF5 curves to plot containing {y_var_names}."
+        )
+
+        sns.set_theme(style="whitegrid")
+        plot_paths = []
+        original_lang_is_chinese = _use_chinese_labels
+
+        for lang in ["en", "cn"]:
+            set_plot_language(lang)
+            colors = sns.color_palette("plasma", len(plot_entries))
+            fig, (ax1, ax2) = plt.subplots(
+                2,
+                1,
+                figsize=(12, 16),
+                sharex=False,
+                gridspec_kw={"height_ratios": [2, 1]},
+            )
+            y_var_names_formatted = [
+                _format_label(y, glossary_maps) for y in y_var_names
+            ]
+            y_label = f"{', '.join(y_var_names_formatted)} ({_get_text('kg')})"
+
+            for i, entry in enumerate(plot_entries):
+                ax1.plot(
+                    entry["time_days"],
+                    entry["y_masked"],
+                    label=entry["label"],
+                    color=colors[i],
+                    linewidth=1.2,
+                    alpha=0.85,
+                )
+
+            ax1.set_ylabel(y_label, fontsize=12)
+            ax1.set_title(_get_text("overall_view"), fontsize=12)
+            ax1.legend(
+                loc="best", title=_format_label(independent_var_name, glossary_maps)
+            )
+            ax1.grid(True)
+
+            if min_y_global != float("inf") and np.isfinite(min_y_global):
+                x1 = 0
+                x2 = min_x_global + 2
+                y_min_in_range = float("inf")
+                y_max_in_range = float("-inf")
+
+                for i, entry in enumerate(plot_entries):
+                    ax2.plot(
+                        entry["time_days"],
+                        entry["y_data"],
+                        label=entry["label"],
+                        color=colors[i],
+                        linewidth=1.8,
+                        alpha=0.9,
+                    )
+
+                    zoom_mask = (entry["time_days"] >= x1) & (entry["time_days"] <= x2)
+                    if zoom_mask.any():
+                        zoom_values = entry["y_data"].loc[zoom_mask]
+                        if not zoom_values.empty:
+                            y_min_in_range = min(y_min_in_range, zoom_values.min())
+                            y_max_in_range = max(y_max_in_range, zoom_values.max())
+
+                y_padding = (y_max_in_range - y_min_in_range) * 0.05
+                y1 = y_min_in_range - y_padding
+                y2 = y_max_in_range + y_padding
+
+                ax2.set_xlim(x1, x2)
+                ax2.set_ylim(y1, y2)
+                ax2.set_xlabel(_get_text("time_days"), fontsize=12)
+                ax2.set_ylabel(y_label, fontsize=12)
+                ax2.set_title(_get_text("detailed_view"), fontsize=12)
+                ax2.grid(True, linestyle="--")
+
+                rect = patches.Rectangle(
+                    (x1, y1),
+                    (x2 - x1),
+                    (y2 - y1),
+                    linewidth=1,
+                    edgecolor="r",
+                    facecolor="none",
+                    linestyle="--",
+                    alpha=0.7,
+                )
+                ax1.add_patch(rect)
+            else:
+                ax2.set_visible(False)
+
+            ax1.set_xlabel(_get_text("time_days"), fontsize=12)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+            safe_y_vars = "_".join(
+                [
+                    var.replace(".", "_").replace("[", "").replace("]", "")
+                    for var in y_var_names
+                ]
+            )
+            safe_param = (
+                raw_plot_alias.replace(".", "_").replace("[", "").replace("]", "")
+            )
+            suffix = "_zh" if lang == "cn" else ""
+            svg_path = os.path.join(
+                save_dir, f"sweep_{safe_y_vars}_vs_{safe_param}{suffix}.svg"
+            )
+
+            try:
+                plt.rcParams["svg.fonttype"] = "path"
+                plt.savefig(svg_path, format="svg", bbox_inches="tight")
+                print(f"Successfully generated combined sweep plot: {svg_path}")
+                plot_paths.append(svg_path)
+            except Exception as e:
+                print(f"Error saving plot: {e}")
+            finally:
+                plt.close(fig)
+
+        set_plot_language("cn" if original_lang_is_chinese else "en")
+        return plot_paths
+
+    try:
+        df = pd.read_csv(csv_path)
 
     except FileNotFoundError:
         print(f"Error: Could not find results file at {csv_path}")

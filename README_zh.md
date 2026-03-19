@@ -101,6 +101,25 @@ image: ghcr.io/asipp-neutronics/tricys_openmodelica_gui:docker_dev
     make dev-install
     ```
 
+## 项目生态与子模块 
+
+TRICYS 平台由多个专业模块协同组成，提供从物理方程求解到前端交互与数据大屏展示的完整体验：
+
+- **`tricys` (核心引擎)**: 负责物理建模、Modelica 集成、参数扫参以及基于 AI 的科研报告生成的 Python 核心库。
+- **`tricys_backend` (后端服务)**: 基于 FastAPI 的高性能 RESTful 服务，管理仿真任务队列、WebSocket 日志流推送以及 HDF5 数据切片服务。
+- **`tricys_visual` (前端主控台)**: 基于 Vue 3 的现代前端框架，提供实时的 3D 数字孪生可视化、拓扑配置编辑器和仿真进度监控。
+- **`tricys_goview` (独立大屏)**: 基于 Vue 3 GoView 架构开发的独立低代码数据大屏，用于渲染高级的全局分析与对比视图。
+
+## 全栈一键启动
+
+如果您希望在本地环境中同时运行整个项目生态（后端引擎 + 两套前端页面），我们在 Windows 平台提供了一个非常便捷的一键启动脚本：
+
+```bash
+# 并行启动 Backend, Visual 和 GoView 服务
+start_all.bat
+```
+
+运行该脚本后，它会自动检测并激活 Python 虚拟环境，并开启三个独立的命令提示符窗口：分别启动 `8000` 端口的 FastAPI 后端服务，以及 `tricys_visual` 和 `tricys_goview` 的前端开发服务器。(提示：请确保在运行脚本前已经完成了各个子工程的 `npm install` 和 `pip install` 依赖安装环节)
 
 ##  文档
 
