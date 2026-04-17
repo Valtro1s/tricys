@@ -17,6 +17,11 @@ class DummySampler:
         self.index += 1
         return sample
 
+    def generate_samples(self, count):
+        batch = self.samples[self.index : self.index + count]
+        self.index += count
+        return batch
+
 
 class DummyExecutor:
     def __init__(self, responses):
@@ -29,6 +34,30 @@ class DummyExecutor:
         if isinstance(response, Exception):
             raise response
         return response
+
+    def run_simulation_batch(self, params_list):
+        records = []
+        for params_dict in params_list:
+            response = self.responses[self.index]
+            self.index += 1
+            if isinstance(response, Exception):
+                records.append(
+                    {
+                        "status": "failed",
+                        "startup_inventory_g": None,
+                        "error": str(response),
+                        **params_dict,
+                    }
+                )
+            else:
+                records.append(
+                    {
+                        "status": "success",
+                        "startup_inventory_g": float(response),
+                        **params_dict,
+                    }
+                )
+        return records
 
 
 class SlowDummyExecutor:
@@ -132,6 +161,32 @@ def test_progress_heartbeat_emits_log(monkeypatch):
     heartbeat.stop()
 
     assert any(message == "Monte Carlo iteration still running" for message, _ in captured)
+
+
+def test_monte_carlo_orchestrator_uses_batch_executor(tmp_path):
+    sampler = DummySampler(
+        [
+            {"blanket.TBR": 1.05},
+            {"blanket.TBR": 1.10},
+            {"blanket.TBR": 1.15},
+        ]
+    )
+    executor = DummyExecutor([100.0, RuntimeError("boom"), 140.0])
+    orchestrator = MonteCarloOrchestrator(
+        sampler=sampler,
+        executor=executor,
+        output_dir=str(tmp_path),
+    )
+
+    result = orchestrator.run(3)
+
+    assert result["successful_runs"] == 2
+    assert result["failed_runs"] == 1
+    assert result["results"] == [100.0, 140.0]
+
+    df = pd.read_csv(result["artifacts"]["csv"])
+    assert len(df) == 3
+    assert list(df["status"]) == ["success", "failed", "success"]
 
 
 def test_monte_carlo_orchestrator_logs_iteration_started(monkeypatch, tmp_path):

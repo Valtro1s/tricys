@@ -37,11 +37,13 @@ class ProgressHeartbeat:
         sample_count: int,
         start_time: float,
         heartbeat_seconds: float,
+        log_message: str = "Monte Carlo iteration still running",
     ) -> None:
         self.iteration = iteration
         self.sample_count = sample_count
         self.start_time = start_time
         self.heartbeat_seconds = heartbeat_seconds
+        self.log_message = log_message
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -60,7 +62,7 @@ class ProgressHeartbeat:
         while not self._stop_event.wait(self.heartbeat_seconds):
             elapsed = time.perf_counter() - self.start_time
             logger.info(
-                "Monte Carlo iteration still running",
+                self.log_message,
                 extra={
                     "iteration": self.iteration,
                     "sample_count": self.sample_count,
@@ -100,10 +102,75 @@ class MonteCarloOrchestrator:
 
         logger.info("Starting Monte Carlo simulation", extra={"sample_count": sample_count})
 
-        for index in range(sample_count):
+        samples = self._generate_samples(sample_count)
+
+        if hasattr(self.executor, "run_simulation_batch") and sample_count > 1:
+            logger.info(
+                "Monte Carlo batch started",
+                extra={
+                    "sample_count": sample_count,
+                    "concurrent": True,
+                },
+            )
+
+            batch_heartbeat = ProgressHeartbeat(
+                iteration=0,
+                sample_count=sample_count,
+                start_time=start_time,
+                heartbeat_seconds=self.heartbeat_seconds,
+                log_message="Monte Carlo batch still running",
+            )
+            batch_heartbeat.start()
+
+            try:
+                batch_records = self.executor.run_simulation_batch(samples)
+            finally:
+                batch_heartbeat.stop()
+
+            for iteration, batch_record in enumerate(batch_records, start=1):
+                status = batch_record.get("status", "failed")
+                startup_inventory = batch_record.get("startup_inventory_g")
+                record = {"iteration": iteration, **batch_record}
+                records.append(record)
+
+                if status == "success" and startup_inventory is not None:
+                    successful_results.append(float(startup_inventory))
+                else:
+                    failed_runs += 1
+
+            total_elapsed = time.perf_counter() - start_time
+            logger.info(
+                "Monte Carlo batch completed",
+                extra={
+                    "sample_count": sample_count,
+                    "success_count": len(successful_results),
+                    "failed_count": failed_runs,
+                    "elapsed_seconds": round(total_elapsed, 3),
+                    "elapsed_human": _format_duration(total_elapsed),
+                },
+            )
+
+            artifact_paths = self._save_results(
+                records=records,
+                successful_results=successful_results,
+                sample_count=sample_count,
+                failed_runs=failed_runs,
+                run_started_at=run_started_at,
+                total_elapsed=total_elapsed,
+            )
+
+            return {
+                "results": successful_results,
+                "records": records,
+                "successful_runs": len(successful_results),
+                "failed_runs": failed_runs,
+                "elapsed_seconds": total_elapsed,
+                "artifacts": artifact_paths,
+            }
+
+        for index, params in enumerate(samples):
             iteration = index + 1
             iteration_start = time.perf_counter()
-            params = self.sampler.generate_sample()
             logger.info(
                 "Monte Carlo iteration started",
                 extra={
@@ -191,6 +258,11 @@ class MonteCarloOrchestrator:
             "elapsed_seconds": total_elapsed,
             "artifacts": artifact_paths,
         }
+
+    def _generate_samples(self, sample_count: int) -> List[Dict[str, Any]]:
+        if hasattr(self.sampler, "generate_samples"):
+            return list(self.sampler.generate_samples(sample_count))
+        return [self.sampler.generate_sample() for _ in range(sample_count)]
 
     def _save_results(
         self,

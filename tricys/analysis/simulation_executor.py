@@ -1,9 +1,10 @@
 """Single-run simulation executor for Monte Carlo workflows."""
 
 import json
+import tempfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -84,6 +85,29 @@ class SimulationExecutor:
             raise RuntimeError("Failed to extract Startup_Inventory from simulation results.")
         return startup_inventory
 
+    def run_simulation_batch(self, params_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Run a batch of simulations and return per-job startup inventory records."""
+        self._validate_params_list(params_list)
+
+        runtime_input, jobs_file_path = self._build_runtime_batch_input(params_list)
+        try:
+            prepared_config, original_config = basic_prepare_config(
+                runtime_input, base_dir=self.base_dir
+            )
+            setup_logging(prepared_config, original_config)
+
+            tricys_run_simulation(prepared_config, export_csv=False)
+
+            return self._extract_batch_results(
+                prepared_config["paths"]["results_dir"],
+                prepared_config.get("metrics_definition", DEFAULT_METRICS_DEFINITION),
+                params_list,
+            )
+        finally:
+            jobs_file = Path(jobs_file_path)
+            if jobs_file.exists():
+                jobs_file.unlink()
+
     def _build_runtime_input(self, params_dict: Dict[str, Any]) -> Dict[str, Any]:
         config = deepcopy(self.base_config)
         config.setdefault("simulation", {})
@@ -101,6 +125,36 @@ class SimulationExecutor:
         config["simulation_parameters"] = simulation_parameters
         return config
 
+    def _build_runtime_batch_input(
+        self, params_list: List[Dict[str, Any]]
+    ) -> tuple[Dict[str, Any], str]:
+        config = deepcopy(self.base_config)
+        config.setdefault("simulation", {})
+        config["simulation"]["concurrent"] = len(params_list) > 1
+        metrics_definition = deepcopy(config.get("metrics_definition", {}))
+        for metric_name, default_definition in DEFAULT_METRICS_DEFINITION.items():
+            existing_definition = deepcopy(metrics_definition.get(metric_name, {}))
+            merged_definition = deepcopy(default_definition)
+            merged_definition.update(existing_definition)
+            metrics_definition[metric_name] = merged_definition
+        config["metrics_definition"] = metrics_definition
+
+        base_parameters = deepcopy(config.get("simulation_parameters", {}))
+        batch_rows = []
+        for params_dict in params_list:
+            row = deepcopy(base_parameters)
+            row.update(params_dict)
+            batch_rows.append(row)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, encoding="utf-8", newline=""
+        ) as file:
+            pd.DataFrame(batch_rows).to_csv(file.name, index=False)
+            jobs_file_path = file.name
+
+        config["simulation_parameters"] = {"file": jobs_file_path}
+        return config, jobs_file_path
+
     @staticmethod
     def _validate_params_dict(params_dict: Dict[str, Any]) -> None:
         if not isinstance(params_dict, dict) or not params_dict:
@@ -111,6 +165,17 @@ class SimulationExecutor:
                 raise ValueError(
                     f"Parameter '{key}' must be a scalar value for single-run execution."
                 )
+
+    @staticmethod
+    def _validate_params_list(params_list: List[Dict[str, Any]]) -> None:
+        if not isinstance(params_list, list) or not params_list:
+            raise ValueError("params_list must be a non-empty list of parameter dictionaries.")
+
+        for index, params_dict in enumerate(params_list, start=1):
+            try:
+                SimulationExecutor._validate_params_dict(params_dict)
+            except ValueError as error:
+                raise ValueError(f"Invalid parameter set at index {index}: {error}") from error
 
     @staticmethod
     def _extract_startup_inventory(
@@ -148,6 +213,58 @@ class SimulationExecutor:
             if startup_inventory is None:
                 return None
             return float(startup_inventory)
+
+    @staticmethod
+    def _extract_batch_results(
+        results_dir: str,
+        metrics_definition: Dict[str, Any],
+        params_list: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        results_path = Path(results_dir)
+        hdf_candidates = sorted(results_path.glob("sweep_results*.h5"))
+        if not hdf_candidates:
+            raise RuntimeError("Failed to find HDF5 results for batch simulation.")
+
+        hdf_path = hdf_candidates[-1]
+        startup_inventory_by_job_id: Dict[int, float] = {}
+
+        with pd.HDFStore(hdf_path, mode="r") as store:
+            if "/summary" in store.keys():
+                summary_df = store.select("summary")
+                if not summary_df.empty and "Startup_Inventory" in summary_df.columns:
+                    valid_rows = summary_df[["job_id", "Startup_Inventory"]].dropna(
+                        subset=["Startup_Inventory"]
+                    )
+                    startup_inventory_by_job_id.update(
+                        {
+                            int(row.job_id): float(row.Startup_Inventory)
+                            for row in valid_rows.itertuples(index=False)
+                        }
+                    )
+
+            if not startup_inventory_by_job_id and "/results" in store.keys():
+                results_df = store.select("results")
+                if not results_df.empty and "job_id" in results_df.columns:
+                    for job_id in sorted(results_df["job_id"].dropna().unique()):
+                        job_df = results_df[results_df["job_id"] == job_id].copy()
+                        metric_values = calculate_single_job_metrics(job_df, metrics_definition)
+                        startup_inventory = metric_values.get("Startup_Inventory")
+                        if startup_inventory is not None:
+                            startup_inventory_by_job_id[int(job_id)] = float(startup_inventory)
+
+        batch_records = []
+        for job_id, params_dict in enumerate(params_list, start=1):
+            startup_inventory = startup_inventory_by_job_id.get(job_id)
+            record = {
+                "status": "success" if startup_inventory is not None else "failed",
+                "startup_inventory_g": startup_inventory,
+                **params_dict,
+            }
+            if startup_inventory is None:
+                record["error"] = "Startup_Inventory missing from batch results."
+            batch_records.append(record)
+
+        return batch_records
 
 
 _DEFAULT_EXECUTOR = SimulationExecutor()

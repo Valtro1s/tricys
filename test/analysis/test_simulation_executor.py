@@ -125,6 +125,120 @@ def test_run_simulation_rejects_sweep_values():
         executor.run_simulation({"blanket.TBR": [1.05, 1.10]})
 
 
+def test_run_simulation_batch_builds_csv_and_returns_records(tmp_path, monkeypatch):
+    base_config = {
+        "paths": {"package_path": "example/example_model_single/example_model.mo"},
+        "simulation": {
+            "model_name": "example_model.Cycle",
+            "variableFilter": "time|sds.inventory",
+            "stop_time": 10.0,
+            "step_size": 1.0,
+        },
+        "metrics_definition": {
+            "Startup_Inventory": {
+                "source_column": "sds.inventory",
+                "method": "calculate_startup_inventory",
+            }
+        },
+    }
+    executor = SimulationExecutor(base_config=base_config, base_dir=str(tmp_path))
+
+    def fake_prepare_config(config_or_path, base_dir=None):
+        prepared = config_or_path.copy()
+        prepared["paths"] = prepared.get("paths", {}).copy()
+        prepared["paths"]["results_dir"] = str(tmp_path / "batch" / "results")
+        prepared["paths"]["temp_dir"] = str(tmp_path / "batch" / "temp")
+        prepared["paths"]["log_dir"] = str(tmp_path / "batch" / "log")
+        return prepared, config_or_path
+
+    def fake_setup_logging(config, original_config=None):
+        return None
+
+    def fake_tricys_run_simulation(config, export_csv=False):
+        jobs_csv_path = config["simulation_parameters"]["file"]
+        jobs_df = pd.read_csv(jobs_csv_path)
+
+        assert len(jobs_df) == 2
+        assert list(jobs_df["blanket.TBR"]) == [1.12, 1.15]
+        assert config["simulation"]["concurrent"] is True
+
+        results_dir = tmp_path / "batch" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        with pd.HDFStore(results_dir / "sweep_results.h5", mode="w") as store:
+            store.put(
+                "summary",
+                pd.DataFrame(
+                    [
+                        {"job_id": 1, "Startup_Inventory": 321.0},
+                        {"job_id": 2, "Startup_Inventory": 654.0},
+                    ]
+                ),
+            )
+
+    monkeypatch.setattr(
+        "tricys.analysis.simulation_executor.basic_prepare_config",
+        fake_prepare_config,
+    )
+    monkeypatch.setattr(
+        "tricys.analysis.simulation_executor.setup_logging",
+        fake_setup_logging,
+    )
+    monkeypatch.setattr(
+        "tricys.analysis.simulation_executor.tricys_run_simulation",
+        fake_tricys_run_simulation,
+    )
+
+    records = executor.run_simulation_batch(
+        [
+            {"blanket.TBR": 1.12},
+            {"blanket.TBR": 1.15},
+        ]
+    )
+
+    assert records == [
+        {"status": "success", "startup_inventory_g": 321.0, "blanket.TBR": 1.12},
+        {"status": "success", "startup_inventory_g": 654.0, "blanket.TBR": 1.15},
+    ]
+
+
+def test_extract_batch_results_marks_missing_jobs_failed(tmp_path):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    hdf_path = results_dir / "sweep_results.h5"
+
+    with pd.HDFStore(hdf_path, mode="w") as store:
+        store.put(
+            "summary",
+            pd.DataFrame(
+                [
+                    {"job_id": 1, "Startup_Inventory": 123.4},
+                ]
+            ),
+        )
+
+    records = SimulationExecutor._extract_batch_results(
+        str(results_dir),
+        {
+            "Startup_Inventory": {
+                "source_column": "sds.inventory",
+                "method": "calculate_startup_inventory",
+            }
+        },
+        [
+            {"blanket.TBR": 1.1},
+            {"blanket.TBR": 1.2},
+        ],
+    )
+
+    assert records[0] == {
+        "status": "success",
+        "startup_inventory_g": 123.4,
+        "blanket.TBR": 1.1,
+    }
+    assert records[1]["status"] == "failed"
+    assert records[1]["startup_inventory_g"] is None
+
+
 def test_build_runtime_input_preserves_user_metric_source_column():
     executor = SimulationExecutor(
         base_config={
